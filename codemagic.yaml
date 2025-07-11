@@ -1,24 +1,27 @@
 workflows:
-  build-ios:
-    name: BitChat iOS Build
+  native-ios:
+    name: BitChat Native iOS Build
     environment:
-      flutter: stable
       xcode: latest
-      cocoapods: default
     scripts:
-      - name: Install dependencies
+      - name: Install CocoaPods
         script: |
-          flutter pub get
           cd ios
-          pod install
-          cd ..
-      - name: Build IPA
+          pod install || echo "No Podfile"
+      - name: Build archive
         script: |
-          flutter build ios --release --no-codesign
+          xcodebuild clean -project BitChat.xcodeproj -scheme BitChat -configuration Release
+          xcodebuild archive \
+            -project BitChat.xcodeproj \
+            -scheme BitChat \
+            -archivePath $CM_BUILD_DIR/BitChat.xcarchive \
+            -sdk iphoneos \
+            -configuration Release
+      - name: Export .ipa
+        script: |
+          xcodebuild -exportArchive \
+            -archivePath $CM_BUILD_DIR/BitChat.xcarchive \
+            -exportOptionsPlist exportOptions.plist \
+            -exportPath $CM_BUILD_DIR/ipa
     artifacts:
-      - build/ios/ipa/*.ipa
-      - build/ios/iphoneos/Runner.app
-    publishing:
-      email:
-        recipients:
-          - mashpotato3171@outlook.com
+      - ipa/*.ipa
