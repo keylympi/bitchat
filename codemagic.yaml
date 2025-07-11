@@ -4,24 +4,27 @@ workflows:
     environment:
       xcode: latest
     scripts:
+      - name: Debug: list available schemes
+        script: |
+          echo "Listing available schemes in bitchat.xcodeproj..."
+          xcodebuild -list -project bitchat.xcodeproj
+
       - name: Build archive
         script: |
-          xcodebuild clean \
-            -project bitchat.xcodeproj \
-            -scheme bitchat \
-            -configuration Release
-
           xcodebuild archive \
             -project bitchat.xcodeproj \
             -scheme bitchat \
             -archivePath $CM_BUILD_DIR/bitchat.xcarchive \
             -sdk iphoneos \
-            -configuration Release
+            -configuration Release \
+            CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO
+
       - name: Export .ipa
         script: |
           xcodebuild -exportArchive \
             -archivePath $CM_BUILD_DIR/bitchat.xcarchive \
             -exportOptionsPlist exportOptions.plist \
             -exportPath $CM_BUILD_DIR/ipa
+
     artifacts:
       - ipa/*.ipa
