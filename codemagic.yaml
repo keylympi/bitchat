@@ -9,17 +9,17 @@ workflows:
           echo "Listing available schemes in bitchat.xcodeproj..."
           xcodebuild -list -project bitchat.xcodeproj
 
-      - name: Build archive
+      - name: build-archive
         script: |
           xcodebuild archive \
             -project bitchat.xcodeproj \
-            -scheme bitchat \
+            -scheme bitchat_iOS \
             -archivePath $CM_BUILD_DIR/bitchat.xcarchive \
             -sdk iphoneos \
             -configuration Release \
             CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO
 
-      - name: Export .ipa
+      - name: export-ipa
         script: |
           xcodebuild -exportArchive \
             -archivePath $CM_BUILD_DIR/bitchat.xcarchive \
