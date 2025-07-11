@@ -4,7 +4,7 @@ workflows:
     environment:
       xcode: latest
     scripts:
-      - name: Debug: list available schemes
+      - name: "Debug: list available schemes"
         script: |
           echo "Listing available schemes in bitchat.xcodeproj..."
           xcodebuild -list -project bitchat.xcodeproj
