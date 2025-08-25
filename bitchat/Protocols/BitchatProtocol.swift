@@ -6,10 +6,65 @@
 // For more information, see <https://unlicense.org>
 //
 
+///
+/// # BitchatProtocol
+///
+/// Defines the application-layer protocol for BitChat mesh networking, including
+/// message types, packet structures, and encoding/decoding logic.
+///
+/// ## Overview
+/// BitchatProtocol implements a binary protocol optimized for Bluetooth LE's
+/// constrained bandwidth and MTU limitations. It provides:
+/// - Efficient binary message encoding
+/// - Message fragmentation for large payloads
+/// - TTL-based routing for mesh networks
+/// - Privacy features like padding and timing obfuscation
+/// - Integration points for end-to-end encryption
+///
+/// ## Protocol Design
+/// The protocol uses a compact binary format to minimize overhead:
+/// - 1-byte message type identifier
+/// - Variable-length fields with length prefixes
+/// - Network byte order (big-endian) for multi-byte values
+/// - PKCS#7-style padding for privacy
+///
+/// ## Message Flow
+/// 1. **Creation**: Messages are created with type, content, and metadata
+/// 2. **Encoding**: Converted to binary format with proper field ordering
+/// 3. **Fragmentation**: Split if larger than BLE MTU (512 bytes)
+/// 4. **Transmission**: Sent via BLEService
+/// 5. **Routing**: Relayed by intermediate nodes (TTL decrements)
+/// 6. **Reassembly**: Fragments collected and reassembled
+/// 7. **Decoding**: Binary data parsed back to message objects
+///
+/// ## Security Considerations
+/// - Message padding obscures actual content length
+/// - Timing obfuscation prevents traffic analysis
+/// - Integration with Noise Protocol for E2E encryption
+/// - No persistent identifiers in protocol headers
+///
+/// ## Message Types
+/// - **Announce/Leave**: Peer presence notifications
+/// - **Message**: User chat messages (broadcast or directed)
+/// - **Fragment**: Multi-part message handling
+/// - **Delivery/Read**: Message acknowledgments
+/// - **Noise**: Encrypted channel establishment
+/// - **Version**: Protocol version negotiation
+///
+/// ## Future Extensions
+/// The protocol is designed to be extensible:
+/// - Reserved message type ranges for future use
+/// - Version field for protocol evolution
+/// - Optional fields for new features
+///
+
 import Foundation
 import CryptoKit
 
-// Privacy-preserving padding utilities
+// MARK: - Message Padding
+
+/// Provides privacy-preserving message padding to obscure actual content length.
+/// Uses PKCS#7-style padding with random bytes to prevent traffic analysis.
 struct MessagePadding {
     // Standard block sizes for padding
     static let blockSizes = [256, 512, 1024, 2048]
@@ -19,31 +74,27 @@ struct MessagePadding {
         guard data.count < targetSize else { return data }
         
         let paddingNeeded = targetSize - data.count
-        
-        // PKCS#7 only supports padding up to 255 bytes
-        // If we need more padding than that, don't pad - return original data
-        guard paddingNeeded <= 255 else { return data }
+        // Constrain to 255 to fit a single-byte pad length marker
+        guard paddingNeeded > 0 && paddingNeeded <= 255 else { return data }
         
         var padded = data
-        
-        // Standard PKCS#7 padding
-        var randomBytes = [UInt8](repeating: 0, count: paddingNeeded - 1)
-        _ = SecRandomCopyBytes(kSecRandomDefault, paddingNeeded - 1, &randomBytes)
-        padded.append(contentsOf: randomBytes)
-        padded.append(UInt8(paddingNeeded))
-        
+        // PKCS#7: All pad bytes are equal to the pad length
+        padded.append(contentsOf: Array(repeating: UInt8(paddingNeeded), count: paddingNeeded))
         return padded
     }
     
     // Remove padding from data
     static func unpad(_ data: Data) -> Data {
         guard !data.isEmpty else { return data }
-        
-        // Last byte tells us how much padding to remove
-        let paddingLength = Int(data[data.count - 1])
+        let last = data.last!
+        let paddingLength = Int(last)
+        // Must have at least 1 pad byte and not exceed data length
         guard paddingLength > 0 && paddingLength <= data.count else { return data }
-        
-        return data.prefix(data.count - paddingLength)
+        // Verify PKCS#7: all last N bytes equal to pad length
+        let start = data.count - paddingLength
+        let tail = data[start...]
+        for b in tail { if b != last { return data } }
+        return Data(data[..<start])
     }
     
     // Find optimal block size for data
@@ -64,26 +115,80 @@ struct MessagePadding {
     }
 }
 
+// MARK: - Message Types
+
+/// Simplified BitChat protocol message types.
+/// Reduced from 24 types to just 6 essential ones.
+/// All private communication metadata (receipts, status) is embedded in noiseEncrypted payloads.
 enum MessageType: UInt8 {
-    case announce = 0x01
-    case keyExchange = 0x02
-    case leave = 0x03
-    case message = 0x04  // All user messages (private and broadcast)
-    case fragmentStart = 0x05
-    case fragmentContinue = 0x06
-    case fragmentEnd = 0x07
-    case channelAnnounce = 0x08  // Announce password-protected channel status
-    case channelRetention = 0x09  // Announce channel retention status
-    case deliveryAck = 0x0A  // Acknowledge message received
-    case deliveryStatusRequest = 0x0B  // Request delivery status update
-    case readReceipt = 0x0C  // Message has been read/viewed
+    // Public messages (unencrypted)
+    case announce = 0x01        // "I'm here" with nickname
+    case message = 0x02         // Public chat message  
+    case leave = 0x03           // "I'm leaving"
+    
+    // Noise encryption
+    case noiseHandshake = 0x10  // Handshake (init or response determined by payload)
+    case noiseEncrypted = 0x11  // All encrypted payloads (messages, receipts, etc.)
+    
+    // Fragmentation (simplified)
+    case fragment = 0x20        // Single fragment type for large messages
+    
+    var description: String {
+        switch self {
+        case .announce: return "announce"
+        case .message: return "message"
+        case .leave: return "leave"
+        case .noiseHandshake: return "noiseHandshake"
+        case .noiseEncrypted: return "noiseEncrypted"
+        case .fragment: return "fragment"
+        }
+    }
 }
 
-// Special recipient ID for broadcast messages
-struct SpecialRecipients {
-    static let broadcast = Data(repeating: 0xFF, count: 8)  // All 0xFF = broadcast
+// MARK: - Noise Payload Types
+
+/// Types of payloads embedded within noiseEncrypted messages.
+/// The first byte of decrypted Noise payload indicates the type.
+/// This provides privacy - observers can't distinguish message types.
+enum NoisePayloadType: UInt8 {
+    // Messages and status
+    case privateMessage = 0x01      // Private chat message
+    case readReceipt = 0x02         // Message was read
+    case delivered = 0x03           // Message was delivered
+    // Verification (QR-based OOB binding)
+    case verifyChallenge = 0x10     // Verification challenge
+    case verifyResponse  = 0x11     // Verification response
+    
+    var description: String {
+        switch self {
+        case .privateMessage: return "privateMessage"
+        case .readReceipt: return "readReceipt"
+        case .delivered: return "delivered"
+        case .verifyChallenge: return "verifyChallenge"
+        case .verifyResponse: return "verifyResponse"
+        }
+    }
 }
 
+// MARK: - Handshake State
+
+// Lazy handshake state tracking
+enum LazyHandshakeState {
+    case none                    // No session, no handshake attempted
+    case handshakeQueued        // User action requires handshake
+    case handshaking           // Currently in handshake process
+    case established           // Session ready for use
+    case failed(Error)         // Handshake failed
+}
+
+//
+
+// MARK: - Core Protocol Structures
+
+/// The core packet structure for all BitChat protocol messages.
+/// Encapsulates all data needed for routing through the mesh network,
+/// including TTL for hop limiting and optional encryption.
+/// - Note: Packets larger than BLE MTU (512 bytes) are automatically fragmented
 struct BitchatPacket: Codable {
     let version: UInt8
     let type: UInt8
@@ -91,7 +196,7 @@ struct BitchatPacket: Codable {
     let recipientID: Data?
     let timestamp: UInt64
     let payload: Data
-    let signature: Data?
+    var signature: Data?
     var ttl: UInt8
     
     init(type: UInt8, senderID: Data, recipientID: Data?, timestamp: UInt64, payload: Data, signature: Data?, ttl: UInt8) {
@@ -109,7 +214,17 @@ struct BitchatPacket: Codable {
     init(type: UInt8, ttl: UInt8, senderID: String, payload: Data) {
         self.version = 1
         self.type = type
-        self.senderID = senderID.data(using: .utf8)!
+        // Convert hex string peer ID to binary data (8 bytes)
+        var senderData = Data()
+        var tempID = senderID
+        while tempID.count >= 2 {
+            let hexByte = String(tempID.prefix(2))
+            if let byte = UInt8(hexByte, radix: 16) {
+                senderData.append(byte)
+            }
+            tempID = String(tempID.dropFirst(2))
+        }
+        self.senderID = senderData
         self.recipientID = nil
         self.timestamp = UInt64(Date().timeIntervalSince1970 * 1000) // milliseconds
         self.payload = payload
@@ -121,8 +236,30 @@ struct BitchatPacket: Codable {
         BinaryProtocol.encode(self)
     }
     
+    func toBinaryData(padding: Bool = true) -> Data? {
+        BinaryProtocol.encode(self, padding: padding)
+    }
+
+    // Backward-compatible helper (defaults to padded encoding)
     func toBinaryData() -> Data? {
-        BinaryProtocol.encode(self)
+        toBinaryData(padding: true)
+    }
+    
+    /// Create binary representation for signing (without signature and TTL fields)
+    /// TTL is excluded because it changes during packet relay operations
+    func toBinaryDataForSigning() -> Data? {
+        // Create a copy without signature and with fixed TTL for signing
+        // TTL must be excluded because it changes during relay
+        let unsignedPacket = BitchatPacket(
+            type: type,
+            senderID: senderID,
+            recipientID: recipientID,
+            timestamp: timestamp,
+            payload: payload,
+            signature: nil, // Remove signature for signing
+            ttl: 0 // Use fixed TTL=0 for signing to ensure relay compatibility
+        )
+        return BinaryProtocol.encode(unsignedPacket)
     }
     
     static func from(_ data: Data) -> BitchatPacket? {
@@ -130,38 +267,15 @@ struct BitchatPacket: Codable {
     }
 }
 
-// Delivery acknowledgment structure
-struct DeliveryAck: Codable {
-    let originalMessageID: String
-    let ackID: String
-    let recipientID: String  // Who received it
-    let recipientNickname: String
-    let timestamp: Date
-    let hopCount: UInt8  // How many hops to reach recipient
-    
-    init(originalMessageID: String, recipientID: String, recipientNickname: String, hopCount: UInt8) {
-        self.originalMessageID = originalMessageID
-        self.ackID = UUID().uuidString
-        self.recipientID = recipientID
-        self.recipientNickname = recipientNickname
-        self.timestamp = Date()
-        self.hopCount = hopCount
-    }
-    
-    func encode() -> Data? {
-        try? JSONEncoder().encode(self)
-    }
-    
-    static func decode(from data: Data) -> DeliveryAck? {
-        try? JSONDecoder().decode(DeliveryAck.self, from: data)
-    }
-}
+//
+
+// MARK: - Read Receipts
 
 // Read receipt structure
 struct ReadReceipt: Codable {
     let originalMessageID: String
     let receiptID: String
-    let readerID: String  // Who read it
+    var readerID: String  // Who read it
     let readerNickname: String
     let timestamp: Date
     
@@ -173,6 +287,15 @@ struct ReadReceipt: Codable {
         self.timestamp = Date()
     }
     
+    // For binary decoding
+    private init(originalMessageID: String, receiptID: String, readerID: String, readerNickname: String, timestamp: Date) {
+        self.originalMessageID = originalMessageID
+        self.receiptID = receiptID
+        self.readerID = readerID
+        self.readerNickname = readerNickname
+        self.timestamp = timestamp
+    }
+    
     func encode() -> Data? {
         try? JSONEncoder().encode(self)
     }
@@ -180,7 +303,66 @@ struct ReadReceipt: Codable {
     static func decode(from data: Data) -> ReadReceipt? {
         try? JSONDecoder().decode(ReadReceipt.self, from: data)
     }
+    
+    // MARK: - Binary Encoding
+    
+    func toBinaryData() -> Data {
+        var data = Data()
+        data.appendUUID(originalMessageID)
+        data.appendUUID(receiptID)
+        // ReaderID as 8-byte hex string
+        var readerData = Data()
+        var tempID = readerID
+        while tempID.count >= 2 && readerData.count < 8 {
+            let hexByte = String(tempID.prefix(2))
+            if let byte = UInt8(hexByte, radix: 16) {
+                readerData.append(byte)
+            }
+            tempID = String(tempID.dropFirst(2))
+        }
+        while readerData.count < 8 {
+            readerData.append(0)
+        }
+        data.append(readerData)
+        data.appendDate(timestamp)
+        data.appendString(readerNickname)
+        return data
+    }
+    
+    static func fromBinaryData(_ data: Data) -> ReadReceipt? {
+        // Create defensive copy
+        let dataCopy = Data(data)
+        
+        // Minimum size: 2 UUIDs (32) + readerID (8) + timestamp (8) + min nickname
+        guard dataCopy.count >= 49 else { return nil }
+        
+        var offset = 0
+        
+        guard let originalMessageID = dataCopy.readUUID(at: &offset),
+              let receiptID = dataCopy.readUUID(at: &offset) else { return nil }
+        
+        guard let readerIDData = dataCopy.readFixedBytes(at: &offset, count: 8) else { return nil }
+        let readerID = readerIDData.hexEncodedString()
+        guard InputValidator.validatePeerID(readerID) else { return nil }
+        
+        guard let timestamp = dataCopy.readDate(at: &offset),
+              InputValidator.validateTimestamp(timestamp),
+              let readerNicknameRaw = dataCopy.readString(at: &offset),
+              let readerNickname = InputValidator.validateNickname(readerNicknameRaw) else { return nil }
+        
+        return ReadReceipt(originalMessageID: originalMessageID,
+                          receiptID: receiptID,
+                          readerID: readerID,
+                          readerNickname: readerNickname,
+                          timestamp: timestamp)
+    }
 }
+
+
+//
+
+
+// MARK: - Delivery Status
 
 // Delivery status for messages
 enum DeliveryStatus: Codable, Equatable {
@@ -209,7 +391,13 @@ enum DeliveryStatus: Codable, Equatable {
     }
 }
 
-struct BitchatMessage: Codable, Equatable {
+// MARK: - Message Model
+
+/// Represents a user-visible message in the BitChat system.
+/// Handles both broadcast messages and private encrypted messages,
+/// with support for mentions, replies, and delivery tracking.
+/// - Note: This is the primary data model for chat messages
+class BitchatMessage: Codable {
     let id: String
     let sender: String
     let content: String
@@ -220,12 +408,26 @@ struct BitchatMessage: Codable, Equatable {
     let recipientNickname: String?
     let senderPeerID: String?
     let mentions: [String]?  // Array of mentioned nicknames
-    let channel: String?  // Channel hashtag (e.g., "#general")
-    let encryptedContent: Data?  // For password-protected rooms
-    let isEncrypted: Bool  // Flag to indicate if content is encrypted
     var deliveryStatus: DeliveryStatus? // Delivery tracking
     
-    init(id: String? = nil, sender: String, content: String, timestamp: Date, isRelay: Bool, originalSender: String? = nil, isPrivate: Bool = false, recipientNickname: String? = nil, senderPeerID: String? = nil, mentions: [String]? = nil, channel: String? = nil, encryptedContent: Data? = nil, isEncrypted: Bool = false, deliveryStatus: DeliveryStatus? = nil) {
+    // Cached formatted text (not included in Codable)
+    private var _cachedFormattedText: [String: AttributedString] = [:]
+    
+    func getCachedFormattedText(isDark: Bool, isSelf: Bool) -> AttributedString? {
+        return _cachedFormattedText["\(isDark)-\(isSelf)"]
+    }
+    
+    func setCachedFormattedText(_ text: AttributedString, isDark: Bool, isSelf: Bool) {
+        _cachedFormattedText["\(isDark)-\(isSelf)"] = text
+    }
+    
+    // Codable implementation
+    enum CodingKeys: String, CodingKey {
+        case id, sender, content, timestamp, isRelay, originalSender
+        case isPrivate, recipientNickname, senderPeerID, mentions, deliveryStatus
+    }
+    
+    init(id: String? = nil, sender: String, content: String, timestamp: Date, isRelay: Bool, originalSender: String? = nil, isPrivate: Bool = false, recipientNickname: String? = nil, senderPeerID: String? = nil, mentions: [String]? = nil, deliveryStatus: DeliveryStatus? = nil) {
         self.id = id ?? UUID().uuidString
         self.sender = sender
         self.content = content
@@ -236,30 +438,43 @@ struct BitchatMessage: Codable, Equatable {
         self.recipientNickname = recipientNickname
         self.senderPeerID = senderPeerID
         self.mentions = mentions
-        self.channel = channel
-        self.encryptedContent = encryptedContent
-        self.isEncrypted = isEncrypted
         self.deliveryStatus = deliveryStatus ?? (isPrivate ? .sending : nil)
     }
 }
+
+// Equatable conformance for BitchatMessage
+extension BitchatMessage: Equatable {
+    static func == (lhs: BitchatMessage, rhs: BitchatMessage) -> Bool {
+        return lhs.id == rhs.id &&
+               lhs.sender == rhs.sender &&
+               lhs.content == rhs.content &&
+               lhs.timestamp == rhs.timestamp &&
+               lhs.isRelay == rhs.isRelay &&
+               lhs.originalSender == rhs.originalSender &&
+               lhs.isPrivate == rhs.isPrivate &&
+               lhs.recipientNickname == rhs.recipientNickname &&
+               lhs.senderPeerID == rhs.senderPeerID &&
+               lhs.mentions == rhs.mentions &&
+               lhs.deliveryStatus == rhs.deliveryStatus
+    }
+}
+
+// MARK: - Delegate Protocol
 
 protocol BitchatDelegate: AnyObject {
     func didReceiveMessage(_ message: BitchatMessage)
     func didConnectToPeer(_ peerID: String)
     func didDisconnectFromPeer(_ peerID: String)
     func didUpdatePeerList(_ peers: [String])
-    func didReceiveChannelLeave(_ channel: String, from peerID: String)
-    func didReceivePasswordProtectedChannelAnnouncement(_ channel: String, isProtected: Bool, creatorID: String?, keyCommitment: String?)
-    func didReceiveChannelRetentionAnnouncement(_ channel: String, enabled: Bool, creatorID: String?)
-    func decryptChannelMessage(_ encryptedContent: Data, channel: String) -> String?
     
     // Optional method to check if a fingerprint belongs to a favorite peer
     func isFavorite(fingerprint: String) -> Bool
     
-    // Delivery confirmation methods
-    func didReceiveDeliveryAck(_ ack: DeliveryAck)
-    func didReceiveReadReceipt(_ receipt: ReadReceipt)
     func didUpdateMessageDeliveryStatus(_ messageID: String, status: DeliveryStatus)
+
+    // Low-level events for better separation of concerns
+    func didReceiveNoisePayload(from peerID: String, type: NoisePayloadType, payload: Data, timestamp: Date)
+    func didReceivePublicMessage(from peerID: String, nickname: String, content: String, timestamp: Date)
 }
 
 // Provide default implementation to make it effectively optional
@@ -268,32 +483,49 @@ extension BitchatDelegate {
         return false
     }
     
-    func didReceiveChannelLeave(_ channel: String, from peerID: String) {
-        // Default empty implementation
-    }
-    
-    func didReceivePasswordProtectedChannelAnnouncement(_ channel: String, isProtected: Bool, creatorID: String?, keyCommitment: String?) {
-        // Default empty implementation
-    }
-    
-    func didReceiveChannelRetentionAnnouncement(_ channel: String, enabled: Bool, creatorID: String?) {
-        // Default empty implementation
-    }
-    
-    func decryptChannelMessage(_ encryptedContent: Data, channel: String) -> String? {
-        // Default returns nil (unable to decrypt)
-        return nil
-    }
-    
-    func didReceiveDeliveryAck(_ ack: DeliveryAck) {
-        // Default empty implementation
-    }
-    
-    func didReceiveReadReceipt(_ receipt: ReadReceipt) {
-        // Default empty implementation
-    }
-    
     func didUpdateMessageDeliveryStatus(_ messageID: String, status: DeliveryStatus) {
         // Default empty implementation
+    }
+
+    func didReceiveNoisePayload(from peerID: String, type: NoisePayloadType, payload: Data, timestamp: Date) {
+        // Default empty implementation
+    }
+
+    func didReceivePublicMessage(from peerID: String, nickname: String, content: String, timestamp: Date) {
+        // Default empty implementation
+    }
+}
+
+// MARK: - Noise Payload Helpers
+
+/// Helper to create typed Noise payloads
+struct NoisePayload {
+    let type: NoisePayloadType
+    let data: Data
+    
+    /// Encode payload with type prefix
+    func encode() -> Data {
+        var encoded = Data()
+        encoded.append(type.rawValue)
+        encoded.append(data)
+        return encoded
+    }
+    
+    /// Decode payload from data
+    static func decode(_ data: Data) -> NoisePayload? {
+        // Ensure we have at least 1 byte for the type
+        guard !data.isEmpty else {
+            return nil
+        }
+        
+        // Safely get the first byte
+        let firstByte = data[data.startIndex]
+        guard let type = NoisePayloadType(rawValue: firstByte) else {
+            return nil
+        }
+        
+        // Create a proper Data copy (not a subsequence) for thread safety
+        let payloadData = data.count > 1 ? Data(data.dropFirst()) : Data()
+        return NoisePayload(type: type, data: payloadData)
     }
 }

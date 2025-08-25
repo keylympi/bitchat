@@ -13,11 +13,16 @@ import UserNotifications
 struct BitchatApp: App {
     @StateObject private var chatViewModel = ChatViewModel()
     #if os(iOS)
+    @Environment(\.scenePhase) var scenePhase
     @UIApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
+    #elseif os(macOS)
+    @NSApplicationDelegateAdaptor(MacAppDelegate.self) var appDelegate
     #endif
     
     init() {
         UNUserNotificationCenter.current().delegate = NotificationDelegate.shared
+        // Warm up georelay directory and refresh if stale (once/day)
+        GeoRelayDirectory.shared.prefetchIfNeeded()
     }
     
     var body: some Scene {
@@ -26,7 +31,16 @@ struct BitchatApp: App {
                 .environmentObject(chatViewModel)
                 .onAppear {
                     NotificationDelegate.shared.chatViewModel = chatViewModel
+                    // Inject live Noise service into VerificationService to avoid creating new BLE instances
+                    VerificationService.shared.configure(with: chatViewModel.meshService.getNoiseService())
+                    // Prewarm Nostr identity and QR to make first VERIFY sheet fast
+                    DispatchQueue.global(qos: .utility).async {
+                        let npub = try? NostrIdentityBridge.getCurrentNostrIdentity()?.npub
+                        _ = VerificationService.shared.buildMyQRString(nickname: chatViewModel.nickname, npub: npub)
+                    }
                     #if os(iOS)
+                    appDelegate.chatViewModel = chatViewModel
+                    #elseif os(macOS)
                     appDelegate.chatViewModel = chatViewModel
                     #endif
                     // Check for shared content
@@ -36,9 +50,28 @@ struct BitchatApp: App {
                     handleURL(url)
                 }
                 #if os(iOS)
+                .onChange(of: scenePhase) { newPhase in
+                    switch newPhase {
+                    case .background:
+                        // Keep BLE mesh running in background; BLEService adapts scanning automatically
+                        break
+                    case .active:
+                        // Restart services when becoming active
+                        chatViewModel.meshService.startServices()
+                        checkForSharedContent()
+                    case .inactive:
+                        break
+                    @unknown default:
+                        break
+                    }
+                }
                 .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
                     // Check for shared content when app becomes active
                     checkForSharedContent()
+                }
+                #elseif os(macOS)
+                .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+                    // App became active
                 }
                 #endif
         }
@@ -58,24 +91,17 @@ struct BitchatApp: App {
     private func checkForSharedContent() {
         // Check app group for shared content from extension
         guard let userDefaults = UserDefaults(suiteName: "group.chat.bitchat") else {
-            print("DEBUG: Failed to access app group UserDefaults")
             return
         }
         
         guard let sharedContent = userDefaults.string(forKey: "sharedContent"),
               let sharedDate = userDefaults.object(forKey: "sharedContentDate") as? Date else {
-            print("DEBUG: No shared content found in UserDefaults")
             return
         }
-        
-        print("DEBUG: Found shared content: \(sharedContent)")
-        print("DEBUG: Shared date: \(sharedDate)")
-        print("DEBUG: Time since shared: \(Date().timeIntervalSince(sharedDate)) seconds")
         
         // Only process if shared within last 30 seconds
         if Date().timeIntervalSince(sharedDate) < 30 {
             let contentType = userDefaults.string(forKey: "sharedContentType") ?? "text"
-            print("DEBUG: Content type: \(contentType)")
             
             // Clear the shared content
             userDefaults.removeObject(forKey: "sharedContent")
@@ -83,43 +109,23 @@ struct BitchatApp: App {
             userDefaults.removeObject(forKey: "sharedContentDate")
             userDefaults.synchronize()
             
-            // Show notification about shared content
+            // Send the shared content immediately on the main queue
             DispatchQueue.main.async {
-                // Add system message about sharing
-                let systemMessage = BitchatMessage(
-                    sender: "system",
-                    content: "preparing to share \(contentType)...",
-                    timestamp: Date(),
-                    isRelay: false
-                )
-                self.chatViewModel.messages.append(systemMessage)
-            }
-            
-            // Send the shared content after a short delay
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
                 if contentType == "url" {
-                    print("DEBUG: Processing URL content")
                     // Try to parse as JSON first
                     if let data = sharedContent.data(using: .utf8),
                        let urlData = try? JSONSerialization.jsonObject(with: data) as? [String: String],
-                       let url = urlData["url"],
-                       let title = urlData["title"] {
-                        // Send just emoji with hidden markdown link
-                        let markdownLink = "👇 [\(title)](\(url))"
-                        print("DEBUG: Sending markdown link: \(markdownLink)")
-                        self.chatViewModel.sendMessage(markdownLink)
+                       let url = urlData["url"] {
+                        // Send plain URL
+                        self.chatViewModel.sendMessage(url)
                     } else {
                         // Fallback to simple URL
-                        print("DEBUG: Failed to parse JSON, sending as plain URL")
-                        self.chatViewModel.sendMessage("Shared link: \(sharedContent)")
+                        self.chatViewModel.sendMessage(sharedContent)
                     }
                 } else {
-                    print("DEBUG: Sending plain text: \(sharedContent)")
                     self.chatViewModel.sendMessage(sharedContent)
                 }
             }
-        } else {
-            print("DEBUG: Shared content is too old, ignoring")
         }
     }
 }
@@ -134,23 +140,36 @@ class AppDelegate: NSObject, UIApplicationDelegate {
 }
 #endif
 
+#if os(macOS)
+import AppKit
+
+class MacAppDelegate: NSObject, NSApplicationDelegate {
+    weak var chatViewModel: ChatViewModel?
+    
+    func applicationWillTerminate(_ notification: Notification) {
+        chatViewModel?.applicationWillTerminate()
+    }
+    
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        return true
+    }
+}
+#endif
+
 class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
     static let shared = NotificationDelegate()
     weak var chatViewModel: ChatViewModel?
     
     func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse, withCompletionHandler completionHandler: @escaping () -> Void) {
         let identifier = response.notification.request.identifier
+        let userInfo = response.notification.request.content.userInfo
         
         // Check if this is a private message notification
         if identifier.hasPrefix("private-") {
-            // Extract sender from notification title
-            let title = response.notification.request.content.title
-            if let senderName = title.replacingOccurrences(of: "Private message from ", with: "").nilIfEmpty {
-                // Find peer ID and open chat
-                if let peerID = chatViewModel?.getPeerIDForNickname(senderName) {
-                    DispatchQueue.main.async {
-                        self.chatViewModel?.startPrivateChat(with: peerID)
-                    }
+            // Get peer ID from userInfo
+            if let peerID = userInfo["peerID"] as? String {
+                DispatchQueue.main.async {
+                    self.chatViewModel?.startPrivateChat(with: peerID)
                 }
             }
         }
@@ -159,7 +178,22 @@ class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
     }
     
     func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification, withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
-        // Show notification even when app is in foreground (for testing)
+        let identifier = notification.request.identifier
+        let userInfo = notification.request.content.userInfo
+        
+        // Check if this is a private message notification
+        if identifier.hasPrefix("private-") {
+            // Get peer ID from userInfo
+            if let peerID = userInfo["peerID"] as? String {
+                // Don't show notification if the private chat is already open
+                if chatViewModel?.selectedPrivateChatPeer == peerID {
+                    completionHandler([])
+                    return
+                }
+            }
+        }
+        
+        // Show notification in all other cases
         completionHandler([.banner, .sound])
     }
 }
