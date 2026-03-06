@@ -4,6 +4,7 @@ import PackageDescription
 
 let package = Package(
     name: "bitchat",
+    defaultLocalization: "en",
     platforms: [
         .iOS(.v16),
         .macOS(.v13)
@@ -15,13 +16,17 @@ let package = Package(
         ),
     ],
     dependencies:[
-        .package(url: "https://github.com/21-DOT-DEV/swift-secp256k1", exact: "0.21.1"),
+        .package(path: "localPackages/Arti"),
+        .package(path: "localPackages/BitLogger"),
+        .package(url: "https://github.com/21-DOT-DEV/swift-secp256k1", exact: "0.21.1")
     ],
     targets: [
         .executableTarget(
             name: "bitchat",
             dependencies: [
-                .product(name: "P256K", package: "swift-secp256k1")
+                .product(name: "P256K", package: "swift-secp256k1"),
+                .product(name: "BitLogger", package: "BitLogger"),
+                .product(name: "Tor", package: "Arti")
             ],
             path: "bitchat",
             exclude: [
@@ -29,8 +34,25 @@ let package = Package(
                 "Assets.xcassets",
                 "bitchat.entitlements",
                 "bitchat-macOS.entitlements",
-                "LaunchScreen.storyboard"
+                "LaunchScreen.storyboard",
+                "ViewModels/Extensions/README.md"
+            ],
+            resources: [
+                .process("Localizable.xcstrings")
             ]
         ),
+        .testTarget(
+            name: "bitchatTests",
+            dependencies: ["bitchat"],
+            path: "bitchatTests",
+            exclude: [
+                "Info.plist",
+                "README.md"
+            ],
+            resources: [
+                .process("Localization"),
+                .process("Noise")
+            ]
+        )
     ]
 )

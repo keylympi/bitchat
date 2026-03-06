@@ -8,26 +8,111 @@ import AppKit
 struct LocationChannelsSheet: View {
     @Binding var isPresented: Bool
     @ObservedObject private var manager = LocationChannelManager.shared
+    @ObservedObject private var bookmarks = GeohashBookmarksStore.shared
+    @ObservedObject private var network = NetworkActivationService.shared
     @EnvironmentObject var viewModel: ChatViewModel
     @Environment(\.colorScheme) var colorScheme
     @State private var customGeohash: String = ""
     @State private var customError: String? = nil
 
+    private var backgroundColor: Color { colorScheme == .dark ? .black : .white }
+
+    private enum Strings {
+        static let title: LocalizedStringKey = "location_channels.title"
+        static let description: LocalizedStringKey = "location_channels.description"
+        static let requestPermissions: LocalizedStringKey = "location_channels.action.request_permissions"
+        static let permissionDenied: LocalizedStringKey = "location_channels.permission_denied"
+        static let openSettings: LocalizedStringKey = "location_channels.action.open_settings"
+        static let loadingNearby: LocalizedStringKey = "location_channels.loading_nearby"
+        static let teleport: LocalizedStringKey = "location_channels.action.teleport"
+        static let bookmarked: LocalizedStringKey = "location_channels.bookmarked_section_title"
+        static let removeAccess: LocalizedStringKey = "location_channels.action.remove_access"
+        static let torTitle: LocalizedStringKey = "location_channels.tor.title"
+        static let torSubtitle: LocalizedStringKey = "location_channels.tor.subtitle"
+        static let toggleOn: LocalizedStringKey = "common.toggle.on"
+        static let toggleOff: LocalizedStringKey = "common.toggle.off"
+
+        static let invalidGeohash = String(localized: "location_channels.error.invalid_geohash", comment: "Error shown when a custom geohash is invalid")
+
+        static func meshTitle(_ count: Int) -> String {
+            let label = String(localized: "location_channels.mesh_label", comment: "Label for the mesh channel row")
+            return rowTitle(label: label, count: count)
+        }
+
+        static func levelTitle(for level: GeohashChannelLevel, count: Int) -> String {
+            // High-precision uncertainty: if count is 0 for high-precision levels,
+            // show "?" because presence broadcasting is disabled for privacy.
+            let isHighPrecision = (level == .neighborhood || level == .block || level == .building)
+            if isHighPrecision && count == 0 {
+                return String(
+                    format: String(localized: "location_channels.row_title_unknown", defaultValue: "%@ [? people]"),
+                    locale: .current,
+                    level.displayName
+                )
+            }
+            return rowTitle(label: level.displayName, count: count)
+        }
+
+        static func bookmarkTitle(geohash: String, count: Int) -> String {
+            // Check precision for bookmarks too
+            let len = geohash.count
+            // Neighborhood=6, Block=7, Building=8+
+            let isHighPrecision = (len >= 6)
+            if isHighPrecision && count == 0 {
+                return String(
+                    format: String(localized: "location_channels.row_title_unknown", defaultValue: "%@ [? people]"),
+                    locale: .current,
+                    "#\(geohash)"
+                )
+            }
+            return rowTitle(label: "#\(geohash)", count: count)
+        }
+
+        static func subtitlePrefix(geohash: String, coverage: String) -> String {
+            String(
+                format: String(localized: "location_channels.subtitle_prefix", comment: "Subtitle prefix showing geohash and coverage"),
+                locale: .current,
+                geohash, coverage
+            )
+        }
+
+        static func subtitle(prefix: String, name: String?) -> String {
+            guard let name, !name.isEmpty else { return prefix }
+            return String(
+                format: String(localized: "location_channels.subtitle_with_name", comment: "Subtitle combining prefix and resolved location name"),
+                locale: .current,
+                prefix, name
+            )
+        }
+
+        private static func rowTitle(label: String, count: Int) -> String {
+            String(
+                format: String(localized: "location_channels.row_title", comment: "List row title with participant count"),
+                locale: .current,
+                label, count
+            )
+        }
+    }
+
     var body: some View {
         NavigationView {
             VStack(alignment: .leading, spacing: 12) {
-                Text("#location channels")
-                    .font(.system(size: 18, design: .monospaced))
-                Text("chat with people near you using geohash channels. only a coarse geohash is shared, never exact gps.")
-                    .font(.system(size: 12, design: .monospaced))
+                HStack(spacing: 12) {
+                    Text(Strings.title)
+                        .font(.bitchatSystem(size: 18, design: .monospaced))
+                    Spacer()
+                    closeButton
+                }
+                Text(Strings.description)
+                    .font(.bitchatSystem(size: 12, design: .monospaced))
                     .foregroundColor(.secondary)
 
                 Group {
                     switch manager.permissionState {
                     case LocationChannelManager.PermissionState.notDetermined:
                         Button(action: { manager.enableLocationChannels() }) {
-                            Text("get location and my geohashes")
-                                .font(.system(size: 12, design: .monospaced))
+                            Text(Strings.requestPermissions)
+                                .font(.bitchatSystem(size: 12, design: .monospaced))
                                 .foregroundColor(standardGreen)
                                 .frame(maxWidth: .infinity)
                                 .padding(.vertical, 6)
@@ -37,10 +122,10 @@ struct LocationChannelsSheet: View {
                         .buttonStyle(.plain)
                     case LocationChannelManager.PermissionState.denied, LocationChannelManager.PermissionState.restricted:
                         VStack(alignment: .leading, spacing: 8) {
-                            Text("location permission denied. enable in settings to use location channels.")
-                                .font(.system(size: 12, design: .monospaced))
+                            Text(Strings.permissionDenied)
+                                .font(.bitchatSystem(size: 12, design: .monospaced))
                                 .foregroundColor(.secondary)
-                            Button("open settings") { openSystemLocationSettings() }
+                            Button(Strings.openSettings) { openSystemLocationSettings() }
                             .buttonStyle(.plain)
                         }
                     case LocationChannelManager.PermissionState.authorized:
@@ -53,29 +138,18 @@ struct LocationChannelsSheet: View {
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 12)
+            .background(backgroundColor)
             #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    Button("close") { isPresented = false }
-                        .font(.system(size: 14, design: .monospaced))
-                }
-            }
+            .navigationBarHidden(true)
             #else
-            .toolbar {
-                ToolbarItem(placement: .automatic) {
-                    Button("close") { isPresented = false }
-                        .font(.system(size: 14, design: .monospaced))
-                }
-            }
+            .navigationTitle("")
             #endif
         }
-        #if os(iOS)
-        .presentationDetents([.large])
-        #endif
         #if os(macOS)
         .frame(minWidth: 420, minHeight: 520)
         #endif
+        .background(backgroundColor)
         .onAppear {
             // Refresh channels when opening
             if manager.permissionState == LocationChannelManager.PermissionState.authorized {
@@ -83,137 +157,237 @@ struct LocationChannelsSheet: View {
             }
             // Begin periodic refresh while sheet is open
             manager.beginLiveRefresh()
-            // Begin multi-channel sampling for counts
-            let ghs = manager.availableChannels.map { $0.geohash }
-            viewModel.beginGeohashSampling(for: ghs)
+            // Geohash sampling is now managed by ChatViewModel globally
         }
         .onDisappear {
             manager.endLiveRefresh()
-            viewModel.endGeohashSampling()
         }
         .onChange(of: manager.permissionState) { newValue in
             if newValue == LocationChannelManager.PermissionState.authorized {
                 manager.refreshChannels()
             }
         }
-        .onChange(of: manager.availableChannels) { newValue in
-            // Keep sampling list in sync with available channels as they refresh live
-            let ghs = newValue.map { $0.geohash }
-            viewModel.beginGeohashSampling(for: ghs)
+        .onChange(of: manager.availableChannels) { _ in }
+    }
+
+    private var closeButton: some View {
+        Button(action: { isPresented = false }) {
+            Image(systemName: "xmark")
+                .font(.bitchatSystem(size: 13, weight: .semibold, design: .monospaced))
+                .frame(width: 32, height: 32)
         }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Close")
     }
 
     private var channelList: some View {
-        List {
-            // Mesh option first
-            channelRow(title: meshTitleWithCount(), subtitlePrefix: "#bluetooth • \(bluetoothRangeString())", isSelected: isMeshSelected, titleColor: standardBlue, titleBold: meshCount() > 0) {
-                manager.select(ChannelID.mesh)
-                isPresented = false
-            }
+        ScrollView {
+            LazyVStack(spacing: 0) {
+                channelRow(title: Strings.meshTitle(meshCount()), subtitlePrefix: Strings.subtitlePrefix(geohash: "bluetooth", coverage: bluetoothRangeString()), isSelected: isMeshSelected, titleColor: standardBlue, titleBold: meshCount() > 0) {
+                    manager.select(ChannelID.mesh)
+                    isPresented = false
+                }
+                .padding(.vertical, 6)
 
-            // Nearby options
-            if !manager.availableChannels.isEmpty {
-                ForEach(manager.availableChannels) { channel in
-                    let coverage = coverageString(forPrecision: channel.geohash.count)
-                    let nameBase = locationName(for: channel.level)
-                    let namePart = nameBase.map { formattedNamePrefix(for: channel.level) + $0 }
-                    let subtitlePrefix = "#\(channel.geohash) • \(coverage)"
-                    let highlight = viewModel.geohashParticipantCount(for: channel.geohash) > 0
-                    channelRow(title: geohashTitleWithCount(for: channel), subtitlePrefix: subtitlePrefix, subtitleName: namePart, isSelected: isSelected(channel), titleBold: highlight) {
-                        // Selecting a suggested nearby channel is not a teleport. Persist this.
-                        manager.markTeleported(for: channel.geohash, false)
+                let nearby = manager.availableChannels.filter { $0.level != .building }
+                if !nearby.isEmpty {
+                    ForEach(nearby) { channel in
+                        sectionDivider
+                        let coverage = coverageString(forPrecision: channel.geohash.count)
+                        let nameBase = locationName(for: channel.level)
+                        let namePart = nameBase.map { formattedNamePrefix(for: channel.level) + $0 }
+                        let participantCount = viewModel.geohashParticipantCount(for: channel.geohash)
+                        let subtitlePrefix = Strings.subtitlePrefix(geohash: channel.geohash, coverage: coverage)
+                        let highlight = participantCount > 0
+                        channelRow(
+                            title: Strings.levelTitle(for: channel.level, count: participantCount),
+                            subtitlePrefix: subtitlePrefix,
+                            subtitleName: namePart,
+                            isSelected: isSelected(channel),
+                            titleBold: highlight,
+                            trailingAccessory: {
+                                Button(action: { bookmarks.toggle(channel.geohash) }) {
+                                    Image(systemName: bookmarks.isBookmarked(channel.geohash) ? "bookmark.fill" : "bookmark")
+                                        .font(.bitchatSystem(size: 14))
+                                }
+                                .buttonStyle(.plain)
+                                .padding(.leading, 8)
+                            }
+                        ) {
+                            manager.markTeleported(for: channel.geohash, false)
+                            manager.select(ChannelID.location(channel))
+                            isPresented = false
+                        }
+                        .padding(.vertical, 6)
+                    }
+                } else {
+                    sectionDivider
+                    HStack(spacing: 8) {
+                        ProgressView()
+                        Text(Strings.loadingNearby)
+                            .font(.bitchatSystem(size: 12, design: .monospaced))
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.vertical, 10)
+                }
+
+                sectionDivider
+                customTeleportSection
+                    .padding(.vertical, 8)
+
+                let bookmarkedList = bookmarks.bookmarks
+                if !bookmarkedList.isEmpty {
+                    sectionDivider
+                    bookmarkedSection(bookmarkedList)
+                        .padding(.vertical, 8)
+                }
+
+                if manager.permissionState == LocationChannelManager.PermissionState.authorized {
+                    sectionDivider
+                    torToggleSection
+                        .padding(.top, 12)
+                    Button(action: {
+                        openSystemLocationSettings()
+                    }) {
+                        Text(Strings.removeAccess)
+                            .font(.bitchatSystem(size: 12, design: .monospaced))
+                            .foregroundColor(Color(red: 0.75, green: 0.1, blue: 0.1))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 6)
+                            .background(Color.red.opacity(0.08))
+                            .cornerRadius(6)
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.vertical, 8)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.vertical, 6)
+            .background(backgroundColor)
+        }
+        .background(backgroundColor)
+    }
+
+    private var sectionDivider: some View {
+        Rectangle()
+            .fill(dividerColor)
+            .frame(height: 1)
+    }
+
+    private var dividerColor: Color {
+        colorScheme == .dark ? Color.white.opacity(0.12) : Color.black.opacity(0.08)
+    }
+
+    private var customTeleportSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 2) {
+                Text(verbatim: "#")
+                    .font(.bitchatSystem(size: 14, design: .monospaced))
+                    .foregroundColor(.secondary)
+                TextField("geohash", text: $customGeohash)
+                    #if os(iOS)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled(true)
+                    .keyboardType(.asciiCapable)
+                    #endif
+                    .font(.bitchatSystem(size: 14, design: .monospaced))
+                    .onChange(of: customGeohash) { newValue in
+                        let allowed = Set("0123456789bcdefghjkmnpqrstuvwxyz")
+                        let filtered = newValue
+                            .lowercased()
+                            .replacingOccurrences(of: "#", with: "")
+                            .filter { allowed.contains($0) }
+                        if filtered.count > 12 {
+                            customGeohash = String(filtered.prefix(12))
+                        } else if filtered != newValue {
+                            customGeohash = filtered
+                        }
+                    }
+                let normalized = customGeohash
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .lowercased()
+                    .replacingOccurrences(of: "#", with: "")
+                let isValid = validateGeohash(normalized)
+                Button(action: {
+                    let gh = normalized
+                    guard isValid else { customError = Strings.invalidGeohash; return }
+                    let level = levelForLength(gh.count)
+                    let ch = GeohashChannel(level: level, geohash: gh)
+                    manager.markTeleported(for: ch.geohash, true)
+                    manager.select(ChannelID.location(ch))
+                    isPresented = false
+                }) {
+                    HStack(spacing: 6) {
+                        Text(Strings.teleport)
+                            .font(.bitchatSystem(size: 14, design: .monospaced))
+                        Image(systemName: "face.dashed")
+                            .font(.bitchatSystem(size: 14))
+                    }
+                }
+                .buttonStyle(.plain)
+                .font(.bitchatSystem(size: 14, design: .monospaced))
+                .padding(.vertical, 6)
+                .padding(.horizontal, 10)
+                .background(Color.secondary.opacity(0.12))
+                .cornerRadius(6)
+                .opacity(isValid ? 1.0 : 0.4)
+                .disabled(!isValid)
+            }
+            if let err = customError {
+                Text(err)
+                    .font(.bitchatSystem(size: 12, design: .monospaced))
+                    .foregroundColor(.red)
+            }
+        }
+    }
+
+    private func bookmarkedSection(_ entries: [String]) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(Strings.bookmarked)
+                .font(.bitchatSystem(size: 12, design: .monospaced))
+                .foregroundColor(.secondary)
+            LazyVStack(spacing: 0) {
+                ForEach(Array(entries.enumerated()), id: \.offset) { index, gh in
+                    let level = levelForLength(gh.count)
+                    let channel = GeohashChannel(level: level, geohash: gh)
+                    let coverage = coverageString(forPrecision: gh.count)
+                    let subtitle = Strings.subtitlePrefix(geohash: gh, coverage: coverage)
+                    let name = bookmarks.bookmarkNames[gh]
+                    let participantCount = viewModel.geohashParticipantCount(for: gh)
+                    channelRow(
+                        title: Strings.bookmarkTitle(geohash: gh, count: participantCount),
+                        subtitlePrefix: subtitle,
+                        subtitleName: name.map { formattedNamePrefix(for: level) + $0 },
+                        isSelected: isSelected(channel),
+                        trailingAccessory: {
+                            Button(action: { bookmarks.toggle(gh) }) {
+                                Image(systemName: bookmarks.isBookmarked(gh) ? "bookmark.fill" : "bookmark")
+                                    .font(.bitchatSystem(size: 14))
+                            }
+                            .buttonStyle(.plain)
+                            .padding(.leading, 8)
+                        }
+                    ) {
+                        let inRegional = manager.availableChannels.contains { $0.geohash == gh }
+                        if !inRegional && !manager.availableChannels.isEmpty {
+                            manager.markTeleported(for: gh, true)
+                        } else {
+                            manager.markTeleported(for: gh, false)
+                        }
                         manager.select(ChannelID.location(channel))
                         isPresented = false
                     }
-                }
-            } else {
-                HStack {
-                    ProgressView()
-                    Text("finding nearby channels…")
-                        .font(.system(size: 12, design: .monospaced))
-                }
-            }
-
-            // Custom geohash teleport
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 2) {
-                    Text("#")
-                        .font(.system(size: 14, design: .monospaced))
-                        .foregroundColor(.secondary)
-                    TextField("geohash", text: $customGeohash)
-                        #if os(iOS)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled(true)
-                        .keyboardType(.asciiCapable)
-                        #endif
-                        .font(.system(size: 14, design: .monospaced))
-                        .onChange(of: customGeohash) { newValue in
-                            // Allow only geohash base32 characters, strip '#', limit length
-                            let allowed = Set("0123456789bcdefghjkmnpqrstuvwxyz")
-                            let filtered = newValue
-                                .lowercased()
-                                .replacingOccurrences(of: "#", with: "")
-                                .filter { allowed.contains($0) }
-                            if filtered.count > 12 {
-                                customGeohash = String(filtered.prefix(12))
-                            } else if filtered != newValue {
-                                customGeohash = filtered
-                            }
-                        }
-                    let normalized = customGeohash.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().replacingOccurrences(of: "#", with: "")
-                    let isValid = validateGeohash(normalized)
-                    Button(action: {
-                        let gh = normalized
-                        guard isValid else { customError = "invalid geohash"; return }
-                        let level = levelForLength(gh.count)
-                        let ch = GeohashChannel(level: level, geohash: gh)
-                        // Mark this selection as a manual teleport
-                        manager.markTeleported(for: ch.geohash, true)
-                        manager.select(ChannelID.location(ch))
-                        isPresented = false
-                    }) {
-                        HStack(spacing: 6) {
-                            Text("teleport")
-                                .font(.system(size: 14, design: .monospaced))
-                            Image(systemName: "face.dashed")
-                                .font(.system(size: 14))
-                        }
-                    }
-                    .buttonStyle(.plain)
-                    .font(.system(size: 14, design: .monospaced))
-                    .padding(.horizontal, 10)
                     .padding(.vertical, 6)
-                    .background(Color.secondary.opacity(0.12))
-                    .cornerRadius(6)
-                    .opacity(isValid ? 1.0 : 0.4)
-                    .disabled(!isValid)
-                }
-                if let err = customError {
-                    Text(err)
-                        .font(.system(size: 12, design: .monospaced))
-                        .foregroundColor(.red)
-                }
-            }
+                    .onAppear { bookmarks.resolveBookmarkNameIfNeeded(for: gh) }
 
-            // Footer action inside the list
-            if manager.permissionState == LocationChannelManager.PermissionState.authorized {
-                Button(action: {
-                    openSystemLocationSettings()
-                }) {
-                    Text("remove location access")
-                        .font(.system(size: 12, design: .monospaced))
-                        .foregroundColor(Color(red: 0.75, green: 0.1, blue: 0.1))
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 6)
-                        .background(Color.red.opacity(0.08))
-                        .cornerRadius(6)
+                    if index < entries.count - 1 {
+                        sectionDivider
+                    }
                 }
-                .buttonStyle(.plain)
-                .listRowSeparator(.hidden)
             }
         }
-        .listStyle(.plain)
     }
+
 
     private func isSelected(_ channel: GeohashChannel) -> Bool {
         if case .location(let ch) = manager.selectedChannel {
@@ -227,49 +401,51 @@ struct LocationChannelsSheet: View {
         return false
     }
 
-    private func channelRow(title: String, subtitlePrefix: String, subtitleName: String? = nil, subtitleNameBold: Bool = false, isSelected: Bool, titleColor: Color? = nil, titleBold: Bool = false, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            HStack {
-                VStack(alignment: .leading) {
-                    // Render title with smaller font for trailing count in parentheses
-                    let parts = splitTitleAndCount(title)
-                    HStack(spacing: 4) {
-                        Text(parts.base)
-                            .font(.system(size: 14, design: .monospaced))
+    @ViewBuilder
+    private func channelRow(
+        title: String,
+        subtitlePrefix: String,
+        subtitleName: String? = nil,
+        subtitleNameBold: Bool = false,
+        isSelected: Bool,
+        titleColor: Color? = nil,
+        titleBold: Bool = false,
+        @ViewBuilder trailingAccessory: () -> some View = { EmptyView() },
+        action: @escaping () -> Void
+    ) -> some View {
+        HStack(alignment: .center, spacing: 8) {
+            VStack(alignment: .leading) {
+                // Render title with smaller font for trailing count in parentheses
+                let parts = splitTitleAndCount(title)
+                HStack(spacing: 4) {
+                    Text(parts.base)
+                            .font(.bitchatSystem(size: 14, design: .monospaced))
                             .fontWeight(titleBold ? .bold : .regular)
                             .foregroundColor(titleColor ?? Color.primary)
                         if let count = parts.countSuffix, !count.isEmpty {
                             Text(count)
-                                .font(.system(size: 11, design: .monospaced))
+                                .font(.bitchatSystem(size: 11, design: .monospaced))
                                 .foregroundColor(.secondary)
                         }
                     }
-                    HStack(spacing: 0) {
-                        Text(subtitlePrefix)
-                            .font(.system(size: 12, design: .monospaced))
-                            .foregroundColor(.secondary)
-                        if let name = subtitleName {
-                            Text(" • ")
-                                .font(.system(size: 12, design: .monospaced))
-                                .foregroundColor(.secondary)
-                            Text(name)
-                                .font(.system(size: 12, design: .monospaced))
-                                .fontWeight(subtitleNameBold ? .bold : .regular)
-                                .foregroundColor(.secondary)
-                        }
-                    }
+                let subtitleFull = Strings.subtitle(prefix: subtitlePrefix, name: subtitleName)
+                Text(subtitleFull)
+                    .font(.bitchatSystem(size: 12, design: .monospaced))
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
                 }
                 Spacer()
                 if isSelected {
-                    Text("✔︎")
-                        .font(.system(size: 16, design: .monospaced))
+                    Text(verbatim: "✔︎")
+                        .font(.bitchatSystem(size: 16, design: .monospaced))
                         .foregroundColor(standardGreen)
                 }
+                trailingAccessory()
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
+        .contentShape(Rectangle())
+        .onTapGesture(perform: action)
     }
 
     // Split a title like "#mesh [3 people]" into base and suffix "[3 people]"
@@ -281,26 +457,13 @@ struct LocationChannelsSheet: View {
     }
 
     // MARK: - Helpers for counts
-    private func meshTitleWithCount() -> String {
-        // Count currently connected mesh peers (excluding self)
-        let meshCount = meshCount()
-        let noun = meshCount == 1 ? "person" : "people"
-        return "mesh [\(meshCount) \(noun)]"
-    }
-
     private func meshCount() -> Int {
+        // Count mesh-connected OR mesh-reachable peers (exclude self)
         let myID = viewModel.meshService.myPeerID
         return viewModel.allPeers.reduce(0) { acc, peer in
-            if peer.id != myID && peer.isConnected { return acc + 1 }
+            if peer.peerID != myID && (peer.isConnected || peer.isReachable) { return acc + 1 }
             return acc
         }
-    }
-
-    private func geohashTitleWithCount(for channel: GeohashChannel) -> String {
-        // Use ViewModel's 5-minute activity counts; may be 0 for non-selected channels
-        let count = viewModel.geohashParticipantCount(for: channel.geohash)
-        let noun = count == 1 ? "person" : "people"
-        return "\(channel.level.displayName.lowercased()) [\(count) \(noun)]"
     }
 
     private func validateGeohash(_ s: String) -> Bool {
@@ -316,18 +479,75 @@ struct LocationChannelsSheet: View {
         case 5: return .city
         case 6: return .neighborhood
         case 7: return .block
+        case 8: return .building
         default: return .block
         }
     }
 }
 
-// MARK: - Standardized Colors
+// MARK: - TOR Toggle & Standardized Colors
 extension LocationChannelsSheet {
+    private var torToggleBinding: Binding<Bool> {
+        Binding(
+            get: { network.userTorEnabled },
+            set: { network.setUserTorEnabled($0) }
+        )
+    }
+
+    private var torToggleSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Toggle(isOn: torToggleBinding) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(Strings.torTitle)
+                        .font(.bitchatSystem(size: 12, weight: .semibold, design: .monospaced))
+                        .foregroundColor(.primary)
+                    Text(Strings.torSubtitle)
+                        .font(.bitchatSystem(size: 11, design: .monospaced))
+                        .foregroundColor(.secondary)
+                }
+            }
+            .toggleStyle(IRCToggleStyle(accent: standardGreen, onLabel: Strings.toggleOn, offLabel: Strings.toggleOff))
+        }
+        .padding(12)
+        .background(Color.secondary.opacity(0.12))
+        .cornerRadius(8)
+    }
+
     private var standardGreen: Color {
         (colorScheme == .dark) ? Color.green : Color(red: 0, green: 0.5, blue: 0)
     }
     private var standardBlue: Color {
         Color(red: 0.0, green: 0.478, blue: 1.0)
+    }
+}
+
+private struct IRCToggleStyle: ToggleStyle {
+    let accent: Color
+    let onLabel: LocalizedStringKey
+    let offLabel: LocalizedStringKey
+
+    func makeBody(configuration: Configuration) -> some View {
+        Button(action: { configuration.isOn.toggle() }) {
+            HStack(spacing: 12) {
+                configuration.label
+                Spacer()
+                Text(configuration.isOn ? onLabel : offLabel)
+                    .textCase(.uppercase)
+                    .font(.bitchatSystem(size: 12, weight: .semibold, design: .monospaced))
+                    .foregroundColor(configuration.isOn ? accent : .secondary)
+                    .padding(.vertical, 4)
+                    .padding(.horizontal, 10)
+                    .background(
+                        RoundedRectangle(cornerRadius: 6)
+                            .fill(accent.opacity(configuration.isOn ? 0.18 : 0.08))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6)
+                            .stroke(accent.opacity(configuration.isOn ? 0.35 : 0.15), lineWidth: 1)
+                    )
+            }
+        }
+        .buttonStyle(.plain)
     }
 }
 
@@ -397,7 +617,7 @@ extension LocationChannelsSheet {
         switch level {
         case .region:
             return ""
-        default:
+        case .building, .block, .neighborhood, .city, .province:
             return "~"
         }
     }

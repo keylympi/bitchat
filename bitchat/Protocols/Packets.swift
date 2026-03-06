@@ -6,15 +6,19 @@ struct AnnouncementPacket {
     let nickname: String
     let noisePublicKey: Data            // Noise static public key (Curve25519.KeyAgreement)
     let signingPublicKey: Data          // Ed25519 public key for signing
+    let directNeighbors: [Data]?        // 8-byte peer IDs
 
     private enum TLVType: UInt8 {
         case nickname = 0x01
         case noisePublicKey = 0x02
         case signingPublicKey = 0x03
+        case directNeighbors = 0x04
     }
 
     func encode() -> Data? {
         var data = Data()
+        // Reserve: TLVs for nickname (2 + n), noise key (2 + 32), signing key (2 + 32)
+        data.reserveCapacity(2 + min(nickname.count, 255) + 2 + noisePublicKey.count + 2 + signingPublicKey.count)
 
         // TLV for nickname
         guard let nicknameData = nickname.data(using: .utf8), nicknameData.count <= 255 else { return nil }
@@ -33,6 +37,16 @@ struct AnnouncementPacket {
         data.append(TLVType.signingPublicKey.rawValue)
         data.append(UInt8(signingPublicKey.count))
         data.append(signingPublicKey)
+        
+        // TLV for direct neighbors (optional)
+        if let neighbors = directNeighbors, !neighbors.isEmpty {
+            let neighborsData = neighbors.prefix(10).reduce(Data()) { $0 + $1 }
+            if !neighborsData.isEmpty && neighborsData.count % 8 == 0 {
+                data.append(TLVType.directNeighbors.rawValue)
+                data.append(UInt8(neighborsData.count))
+                data.append(neighborsData)
+            }
+        }
 
         return data
     }
@@ -42,6 +56,7 @@ struct AnnouncementPacket {
         var nickname: String?
         var noisePublicKey: Data?
         var signingPublicKey: Data?
+        var directNeighbors: [Data]?
 
         while offset + 2 <= data.count {
             let typeRaw = data[offset]
@@ -61,6 +76,17 @@ struct AnnouncementPacket {
                     noisePublicKey = Data(value)
                 case .signingPublicKey:
                     signingPublicKey = Data(value)
+                case .directNeighbors:
+                    if length > 0 && length % 8 == 0 {
+                        var neighbors = [Data]()
+                        let count = length / 8
+                        for i in 0..<count {
+                            let start = value.startIndex + i * 8
+                            let end = start + 8
+                            neighbors.append(Data(value[start..<end]))
+                        }
+                        directNeighbors = neighbors
+                    }
                 }
             } else {
                 // Unknown TLV; skip (tolerant decoder for forward compatibility)
@@ -72,7 +98,8 @@ struct AnnouncementPacket {
         return AnnouncementPacket(
             nickname: nickname,
             noisePublicKey: noisePublicKey,
-            signingPublicKey: signingPublicKey
+            signingPublicKey: signingPublicKey,
+            directNeighbors: directNeighbors
         )
     }
 }
@@ -88,6 +115,7 @@ struct PrivateMessagePacket {
 
     func encode() -> Data? {
         var data = Data()
+        data.reserveCapacity(2 + min(messageID.count, 255) + 2 + min(content.count, 255))
 
         // TLV for messageID
         guard let messageIDData = messageID.data(using: .utf8), messageIDData.count <= 255 else { return nil }

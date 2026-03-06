@@ -1,5 +1,4 @@
 import Foundation
-import CryptoKit
 
 /// QR verification scaffolding: schema, signing, and basic challenge/response helpers.
 final class VerificationService {
@@ -95,14 +94,14 @@ final class VerificationService {
                                     nickname: payload.nickname,
                                     ts: payload.ts,
                                     nonceB64: payload.nonceB64,
-                                    sigHex: sig.map { String(format: "%02x", $0) }.joined())
+                                    sigHex: sig.hexEncodedString())
         let out = signed.toURLString()
         Cache.last = (nickname, npub, Date(), out)
         return out
     }
 
     /// Verify a scanned QR and return the parsed payload if valid (signature + freshness checks)
-    func verifyScannedQR(_ urlString: String, maxAge: TimeInterval = 5 * 60) -> VerificationQR? {
+    func verifyScannedQR(_ urlString: String, maxAge: TimeInterval = TransportConfig.verificationQRMaxAgeSeconds) -> VerificationQR? {
         guard let url = URL(string: urlString), let qr = VerificationQR.fromURL(url) else { return nil }
         // Freshness
         let now = Date().timeIntervalSince1970

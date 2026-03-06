@@ -14,12 +14,23 @@ import UIKit
 import AppKit
 #endif
 
-class NotificationService {
+final class NotificationService {
     static let shared = NotificationService()
-    
+
+    /// Returns true if running in test environment (XCTest, Swift Testing, or CI)
+    private var isRunningTests: Bool {
+        let env = ProcessInfo.processInfo.environment
+        return NSClassFromString("XCTestCase") != nil ||
+               env["XCTestConfigurationFilePath"] != nil ||
+               env["XCTestBundlePath"] != nil ||
+               env["GITHUB_ACTIONS"] != nil ||
+               env["CI"] != nil
+    }
+
     private init() {}
-    
+
     func requestAuthorization() {
+        guard !isRunningTests else { return }
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { granted, error in
             if granted {
                 // Permission granted
@@ -29,28 +40,31 @@ class NotificationService {
         }
     }
     
-    func sendLocalNotification(title: String, body: String, identifier: String, userInfo: [String: Any]? = nil) {
-        // For now, skip app state check entirely to avoid thread issues
-        // The NotificationDelegate will handle foreground presentation
-        DispatchQueue.main.async {
-            let content = UNMutableNotificationContent()
-            content.title = title
-            content.body = body
-            content.sound = .default
-            if let userInfo = userInfo {
-                content.userInfo = userInfo
-            }
-            
-            let request = UNNotificationRequest(
-                identifier: identifier,
-                content: content,
-                trigger: nil // Deliver immediately
-            )
-            
-            UNUserNotificationCenter.current().add(request) { _ in
-                // Notification added
-            }
+    func sendLocalNotification(
+        title: String,
+        body: String,
+        identifier: String,
+        userInfo: [String: Any]? = nil,
+        interruptionLevel: UNNotificationInterruptionLevel = .active
+    ) {
+        guard !isRunningTests else { return }
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+        content.interruptionLevel = interruptionLevel
+
+        if let userInfo = userInfo {
+            content.userInfo = userInfo
         }
+
+        let request = UNNotificationRequest(
+            identifier: identifier,
+            content: content,
+            trigger: nil // Deliver immediately
+        )
+
+        UNUserNotificationCenter.current().add(request)
     }
     
     func sendMentionNotification(from sender: String, message: String) {
@@ -61,58 +75,35 @@ class NotificationService {
         sendLocalNotification(title: title, body: body, identifier: identifier)
     }
     
-    func sendPrivateMessageNotification(from sender: String, message: String, peerID: String) {
-        let title = "🔒 private message from \(sender)"
+    func sendPrivateMessageNotification(from sender: String, message: String, peerID: PeerID) {
+        let title = "🔒 DM from \(sender)"
         let body = message
         let identifier = "private-\(UUID().uuidString)"
-        let userInfo = ["peerID": peerID, "senderName": sender]
+        let userInfo = ["peerID": peerID.id, "senderName": sender]
         
         sendLocalNotification(title: title, body: body, identifier: identifier, userInfo: userInfo)
     }
     
-    func sendFavoriteOnlineNotification(nickname: String) {
-        // Send directly without checking app state for favorites
-        DispatchQueue.main.async {
-            let content = UNMutableNotificationContent()
-            content.title = "⭐ \(nickname) is online!"
-            content.body = "wanna get in there?"
-            content.sound = .default
-            
-            let request = UNNotificationRequest(
-                identifier: "favorite-online-\(UUID().uuidString)",
-                content: content,
-                trigger: nil
-            )
-            
-            UNUserNotificationCenter.current().add(request) { _ in
-                // Notification added
-            }
-        }
+    // Geohash public chat notification with deep link to a specific geohash
+    func sendGeohashActivityNotification(geohash: String, titlePrefix: String = "#", bodyPreview: String) {
+        let title = "\(titlePrefix)\(geohash)"
+        let identifier = "geo-activity-\(geohash)-\(Date().timeIntervalSince1970)"
+        let deeplink = "bitchat://geohash/\(geohash)"
+        let userInfo: [String: Any] = ["deeplink": deeplink]
+        sendLocalNotification(title: title, body: bodyPreview, identifier: identifier, userInfo: userInfo)
     }
-    
+
     func sendNetworkAvailableNotification(peerCount: Int) {
         let title = "👥 bitchatters nearby!"
         let body = peerCount == 1 ? "1 person around" : "\(peerCount) people around"
-        let identifier = "network-available-\(Date().timeIntervalSince1970)"
-        
-        // For network notifications, we want to show them even in foreground
-        // No app state check - let the notification delegate handle presentation
-        DispatchQueue.main.async {
-            let content = UNMutableNotificationContent()
-            content.title = title
-            content.body = body
-            content.sound = .default
-            content.interruptionLevel = .timeSensitive  // Make it more prominent
-            
-            let request = UNNotificationRequest(
-                identifier: identifier,
-                content: content,
-                trigger: nil // Deliver immediately
-            )
-            
-            UNUserNotificationCenter.current().add(request) { _ in
-                // Notification added
-            }
-        }
+        // Fixed identifier so iOS updates the existing notification instead of creating new ones
+        let identifier = "network-available"
+
+        sendLocalNotification(
+            title: title,
+            body: body,
+            identifier: identifier,
+            interruptionLevel: .timeSensitive
+        )
     }
 }

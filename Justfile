@@ -14,16 +14,16 @@ default:
 # Check prerequisites
 check:
     @echo "Checking prerequisites..."
-    @command -v xcodegen >/dev/null 2>&1 || (echo "❌ XcodeGen not found. Install with: brew install xcodegen" && exit 1)
-    @command -v xcodebuild >/dev/null 2>&1 || (echo "❌ Xcode not found. Install Xcode from App Store" && exit 1)
-    @security find-identity -v -p codesigning | grep -q "Developer ID" || (echo "⚠️  No Developer ID found - code signing may fail" && exit 0)
+    @command -v xcodebuild >/dev/null 2>&1 || (echo "❌ xcodebuild not found. Install Xcode from App Store" && exit 1)
+    @xcode-select -p | grep -q "Xcode.app" || (echo "❌ Full Xcode required, not just command line tools. Install from App Store and run:\n   sudo xcode-select -s /Applications/Xcode.app/Contents/Developer" && exit 1)
+    @test -d "/Applications/Xcode.app" || (echo "❌ Xcode.app not found in Applications folder. Install from App Store" && exit 1)
+    @xcodebuild -version >/dev/null 2>&1 || (echo "❌ Xcode not properly configured. Try:\n   sudo xcode-select -s /Applications/Xcode.app/Contents/Developer" && exit 1)
+    @security find-identity -v -p codesigning | grep -q "Apple Development\|Developer ID" || (echo "⚠️  No Developer ID found - code signing may fail" && exit 0)
     @echo "✅ All prerequisites met"
 
 # Backup original files
 backup:
     @echo "Backing up original project configuration..."
-    @cp project.yml project.yml.backup 2>/dev/null || true
-    @# Backup other files that get modified by xcodegen
     @if [ -f bitchat.xcodeproj/project.pbxproj ]; then cp bitchat.xcodeproj/project.pbxproj bitchat.xcodeproj/project.pbxproj.backup; fi
     @if [ -f bitchat/Info.plist ]; then cp bitchat/Info.plist bitchat/Info.plist.backup; fi
 
@@ -44,13 +44,8 @@ patch-for-macos: backup
     @# Move iOS-specific files out of the way temporarily
     @if [ -f bitchat/LaunchScreen.storyboard ]; then mv bitchat/LaunchScreen.storyboard bitchat/LaunchScreen.storyboard.ios; fi
 
-# Generate Xcode project with patches
-generate: patch-for-macos
-    @echo "Generating Xcode project..."
-    @xcodegen generate
-
 # Build the macOS app
-build: check generate
+build: #check generate
     @echo "Building BitChat for macOS..."
     @xcodebuild -project bitchat.xcodeproj -scheme "bitchat (macOS)" -configuration Debug CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGN_ENTITLEMENTS="" build
 
@@ -75,9 +70,7 @@ clean: restore
 # Quick run without cleaning (for development)
 dev-run: check
     @echo "Quick development build..."
-    @if [ ! -f project.yml.backup ]; then just patch-for-macos; fi
-    @xcodegen generate
-    @xcodebuild -project bitchat.xcodeproj -scheme "bitchat (macOS)" -configuration Debug CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGN_ENTITLEMENTS="" build
+    @xcodebuild -project bitchat.xcodeproj -scheme "bitchat_macOS" -configuration Debug CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGN_ENTITLEMENTS="" build
     @find ~/Library/Developer/Xcode/DerivedData -name "bitchat.app" -path "*/Debug/*" -not -path "*/Index.noindex/*" | head -1 | xargs -I {} open "{}"
 
 # Show app info
@@ -106,11 +99,9 @@ nuke:
     @echo "🧨 Nuclear clean - removing all build artifacts and backups..."
     @rm -rf ~/Library/Developer/Xcode/DerivedData/bitchat-* 2>/dev/null || true
     @rm -rf bitchat.xcodeproj 2>/dev/null || true
-    @rm -f project.yml.backup 2>/dev/null || true
-    @rm -f project-macos.yml 2>/dev/null || true
     @rm -f bitchat.xcodeproj/project.pbxproj.backup 2>/dev/null || true
     @rm -f bitchat/Info.plist.backup 2>/dev/null || true
     @# Restore iOS-specific files if they were moved
     @if [ -f bitchat/LaunchScreen.storyboard.ios ]; then mv bitchat/LaunchScreen.storyboard.ios bitchat/LaunchScreen.storyboard; fi
-    @git checkout -- project.yml bitchat.xcodeproj/project.pbxproj bitchat/Info.plist 2>/dev/null || echo "⚠️  Not a git repo or no changes to restore"
+    @git checkout bitchat.xcodeproj/project.pbxproj bitchat/Info.plist 2>/dev/null || echo "⚠️  Not a git repo or no changes to restore"
     @echo "✅ Nuclear clean complete"

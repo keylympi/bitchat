@@ -15,15 +15,54 @@ enum CommandResult {
     case handled  // Command handled, no message needed
 }
 
+/// Simple struct for geo participant info used by CommandProcessor
+struct CommandGeoParticipant {
+    let id: String        // pubkey hex (lowercased)
+    let displayName: String
+}
+
+/// Protocol defining what CommandProcessor needs from its context.
+/// This breaks the circular dependency between CommandProcessor and ChatViewModel.
+@MainActor
+protocol CommandContextProvider: AnyObject {
+    // MARK: - State Properties
+    var nickname: String { get }
+    var selectedPrivateChatPeer: PeerID? { get }
+    var blockedUsers: Set<String> { get }
+    var privateChats: [PeerID: [BitchatMessage]] { get set }
+    var idBridge: NostrIdentityBridge { get }
+
+    // MARK: - Peer Lookup
+    func getPeerIDForNickname(_ nickname: String) -> PeerID?
+    func getVisibleGeoParticipants() -> [CommandGeoParticipant]
+    func nostrPubkeyForDisplayName(_ displayName: String) -> String?
+
+    // MARK: - Chat Actions
+    func startPrivateChat(with peerID: PeerID)
+    func sendPrivateMessage(_ content: String, to peerID: PeerID)
+    func clearCurrentPublicTimeline()
+    func sendPublicRaw(_ content: String)
+
+    // MARK: - System Messages
+    func addLocalPrivateSystemMessage(_ content: String, to peerID: PeerID)
+    func addPublicSystemMessage(_ content: String)
+
+    // MARK: - Favorites
+    func toggleFavorite(peerID: PeerID)
+    func sendFavoriteNotification(to peerID: PeerID, isFavorite: Bool)
+}
+
 /// Processes chat commands in a focused, efficient way
 @MainActor
-class CommandProcessor {
-    weak var chatViewModel: ChatViewModel?
+final class CommandProcessor {
+    weak var contextProvider: CommandContextProvider?
     weak var meshService: Transport?
-    
-    init(chatViewModel: ChatViewModel? = nil, meshService: Transport? = nil) {
-        self.chatViewModel = chatViewModel
+    private let identityManager: SecureIdentityStateManagerProtocol
+
+    init(contextProvider: CommandContextProvider? = nil, meshService: Transport? = nil, identityManager: SecureIdentityStateManagerProtocol) {
+        self.contextProvider = contextProvider
         self.meshService = meshService
+        self.identityManager = identityManager
     }
     
     /// Process a command string
@@ -40,7 +79,7 @@ class CommandProcessor {
             case .location: return true
             }
         }()
-        let inGeoDM = (chatViewModel?.selectedPrivateChatPeer?.hasPrefix("nostr_") == true)
+        let inGeoDM = contextProvider?.selectedPrivateChatPeer?.isGeoDM == true
 
         switch cmd {
         case "/m", "/msg":
@@ -50,9 +89,9 @@ class CommandProcessor {
         case "/clear":
             return handleClear()
         case "/hug":
-            return handleEmote(args, action: "hugs", emoji: "🫂")
+            return handleEmote(args, command: "hug", action: "hugs", emoji: "🫂")
         case "/slap":
-            return handleEmote(args, action: "slaps", emoji: "🐟", suffix: " around a bit with a large trout")
+            return handleEmote(args, command: "slap", action: "slaps", emoji: "🐟", suffix: " around a bit with a large trout")
         case "/block":
             return handleBlock(args)
         case "/unblock":
@@ -63,14 +102,11 @@ class CommandProcessor {
         case "/unfav":
             if inGeoPublic || inGeoDM { return .error(message: "favorites are only for mesh peers in #mesh") }
             return handleFavorite(args, add: false)
-        //
-        case "/help", "/h":
-            return .error(message: "unknown command: \(cmd)")
         default:
             return .error(message: "unknown command: \(cmd)")
         }
     }
-    
+
     // MARK: - Command Handlers
     
     private func handleMessage(_ args: String) -> CommandResult {
@@ -82,15 +118,15 @@ class CommandProcessor {
         let targetName = String(parts[0])
         let nickname = targetName.hasPrefix("@") ? String(targetName.dropFirst()) : targetName
         
-        guard let peerID = chatViewModel?.getPeerIDForNickname(nickname) else {
+        guard let peerID = contextProvider?.getPeerIDForNickname(nickname) else {
             return .error(message: "'\(nickname)' not found")
         }
-        
-        chatViewModel?.startPrivateChat(with: peerID)
-        
+
+        contextProvider?.startPrivateChat(with: peerID)
+
         if parts.count > 1 {
             let message = String(parts[1])
-            chatViewModel?.sendPrivateMessage(message, to: peerID)
+            contextProvider?.sendPrivateMessage(message, to: peerID)
         }
         
         return .success(message: "started private chat with \(nickname)")
@@ -101,9 +137,9 @@ class CommandProcessor {
         switch LocationChannelManager.shared.selectedChannel {
         case .location(let ch):
             // Geohash context: show visible geohash participants (exclude self)
-            guard let vm = chatViewModel else { return .success(message: "nobody around") }
-            let myHex = (try? NostrIdentityBridge.deriveIdentity(forGeohash: ch.geohash))?.publicKeyHex.lowercased()
-            let people = vm.visibleGeohashPeople().filter { person in
+            guard let vm = contextProvider else { return .success(message: "nobody around") }
+            let myHex = (try? vm.idBridge.deriveIdentity(forGeohash: ch.geohash))?.publicKeyHex.lowercased()
+            let people = vm.getVisibleGeoParticipants().filter { person in
                 if let me = myHex { return person.id.lowercased() != me }
                 return true
             }
@@ -121,35 +157,35 @@ class CommandProcessor {
     }
     
     private func handleClear() -> CommandResult {
-        if let peerID = chatViewModel?.selectedPrivateChatPeer {
-            chatViewModel?.privateChats[peerID]?.removeAll()
+        if let peerID = contextProvider?.selectedPrivateChatPeer {
+            contextProvider?.privateChats[peerID]?.removeAll()
         } else {
-            chatViewModel?.clearCurrentPublicTimeline()
+            contextProvider?.clearCurrentPublicTimeline()
         }
         return .handled
     }
     
-    private func handleEmote(_ args: String, action: String, emoji: String, suffix: String = "") -> CommandResult {
+    private func handleEmote(_ args: String, command: String, action: String, emoji: String, suffix: String = "") -> CommandResult {
         let targetName = args.trimmingCharacters(in: .whitespaces)
         guard !targetName.isEmpty else {
-            return .error(message: "usage: /\(action) <nickname>")
+            return .error(message: "usage: /\(command) <nickname>")
         }
         
         let nickname = targetName.hasPrefix("@") ? String(targetName.dropFirst()) : targetName
         
-        guard let targetPeerID = chatViewModel?.getPeerIDForNickname(nickname),
-              let myNickname = chatViewModel?.nickname else {
-            return .error(message: "cannot \(action) \(nickname): not found")
+        guard let targetPeerID = contextProvider?.getPeerIDForNickname(nickname),
+              let myNickname = contextProvider?.nickname else {
+            return .error(message: "cannot \(command) \(nickname): not found")
         }
         
         let emoteContent = "* \(emoji) \(myNickname) \(action) \(nickname)\(suffix) *"
         
-        if chatViewModel?.selectedPrivateChatPeer != nil {
+        if contextProvider?.selectedPrivateChatPeer != nil {
             // In private chat
             if let peerNickname = meshService?.peerNickname(peerID: targetPeerID) {
                 let personalMessage = "* \(emoji) \(myNickname) \(action) you\(suffix) *"
-                meshService?.sendPrivateMessage(personalMessage, to: targetPeerID, 
-                                               recipientNickname: peerNickname, 
+                meshService?.sendPrivateMessage(personalMessage, to: targetPeerID,
+                                               recipientNickname: peerNickname,
                                                messageID: UUID().uuidString)
                 // Also add a local system message so the sender sees a natural-language confirmation
                 let pastAction: String = {
@@ -160,13 +196,13 @@ class CommandProcessor {
                     }
                 }()
                 let localText = "\(emoji) you \(pastAction) \(nickname)\(suffix)"
-                chatViewModel?.addLocalPrivateSystemMessage(localText, to: targetPeerID)
+                contextProvider?.addLocalPrivateSystemMessage(localText, to: targetPeerID)
             }
         } else {
             // In public chat: send to active public channel (mesh or geohash)
-            chatViewModel?.sendPublicRaw(emoteContent)
+            contextProvider?.sendPublicRaw(emoteContent)
             let publicEcho = "\(emoji) \(myNickname) \(action) \(nickname)\(suffix)"
-            chatViewModel?.addPublicSystemMessage(publicEcho)
+            contextProvider?.addPublicSystemMessage(publicEcho)
         }
         
         return .handled
@@ -177,7 +213,7 @@ class CommandProcessor {
         
         if targetName.isEmpty {
             // List blocked users (mesh) and geohash (Nostr) blocks
-            let meshBlocked = chatViewModel?.blockedUsers ?? []
+            let meshBlocked = contextProvider?.blockedUsers ?? []
             var blockedNicknames: [String] = []
             if let peers = meshService?.getPeerNicknames() {
                 for (peerID, nickname) in peers {
@@ -189,10 +225,10 @@ class CommandProcessor {
             }
 
             // Geohash blocked names (prefer visible display names; fallback to #suffix)
-            let geoBlocked = Array(SecureIdentityStateManager.shared.getBlockedNostrPubkeys())
+            let geoBlocked = Array(identityManager.getBlockedNostrPubkeys())
             var geoNames: [String] = []
-            if let vm = chatViewModel {
-                let visible = vm.visibleGeohashPeople()
+            if let vm = contextProvider {
+                let visible = vm.getVisibleGeoParticipants()
                 let visibleIndex = Dictionary(uniqueKeysWithValues: visible.map { ($0.id.lowercased(), $0.displayName) })
                 for pk in geoBlocked {
                     if let name = visibleIndex[pk.lowercased()] {
@@ -211,16 +247,16 @@ class CommandProcessor {
         
         let nickname = targetName.hasPrefix("@") ? String(targetName.dropFirst()) : targetName
         
-        if let peerID = chatViewModel?.getPeerIDForNickname(nickname),
+        if let peerID = contextProvider?.getPeerIDForNickname(nickname),
            let fingerprint = meshService?.getFingerprint(for: peerID) {
-            if SecureIdentityStateManager.shared.isBlocked(fingerprint: fingerprint) {
+            if identityManager.isBlocked(fingerprint: fingerprint) {
                 return .success(message: "\(nickname) is already blocked")
             }
             // Block the user (mesh/noise identity)
-            if var identity = SecureIdentityStateManager.shared.getSocialIdentity(for: fingerprint) {
+            if var identity = identityManager.getSocialIdentity(for: fingerprint) {
                 identity.isBlocked = true
                 identity.isFavorite = false
-                SecureIdentityStateManager.shared.updateSocialIdentity(identity)
+                identityManager.updateSocialIdentity(identity)
             } else {
                 let blockedIdentity = SocialIdentity(
                     fingerprint: fingerprint,
@@ -231,16 +267,16 @@ class CommandProcessor {
                     isBlocked: true,
                     notes: nil
                 )
-                SecureIdentityStateManager.shared.updateSocialIdentity(blockedIdentity)
+                identityManager.updateSocialIdentity(blockedIdentity)
             }
             return .success(message: "blocked \(nickname). you will no longer receive messages from them")
         }
         // Mesh lookup failed; try geohash (Nostr) participant by display name
-        if let pub = chatViewModel?.nostrPubkeyForDisplayName(nickname) {
-            if SecureIdentityStateManager.shared.isNostrBlocked(pubkeyHexLowercased: pub) {
+        if let pub = contextProvider?.nostrPubkeyForDisplayName(nickname) {
+            if identityManager.isNostrBlocked(pubkeyHexLowercased: pub) {
                 return .success(message: "\(nickname) is already blocked")
             }
-            SecureIdentityStateManager.shared.setNostrBlocked(pub, isBlocked: true)
+            identityManager.setNostrBlocked(pub, isBlocked: true)
             return .success(message: "blocked \(nickname) in geohash chats")
         }
         
@@ -255,20 +291,20 @@ class CommandProcessor {
         
         let nickname = targetName.hasPrefix("@") ? String(targetName.dropFirst()) : targetName
         
-        if let peerID = chatViewModel?.getPeerIDForNickname(nickname),
+        if let peerID = contextProvider?.getPeerIDForNickname(nickname),
            let fingerprint = meshService?.getFingerprint(for: peerID) {
-            if !SecureIdentityStateManager.shared.isBlocked(fingerprint: fingerprint) {
+            if !identityManager.isBlocked(fingerprint: fingerprint) {
                 return .success(message: "\(nickname) is not blocked")
             }
-            SecureIdentityStateManager.shared.setBlocked(fingerprint, isBlocked: false)
+            identityManager.setBlocked(fingerprint, isBlocked: false)
             return .success(message: "unblocked \(nickname)")
         }
         // Try geohash unblock
-        if let pub = chatViewModel?.nostrPubkeyForDisplayName(nickname) {
-            if !SecureIdentityStateManager.shared.isNostrBlocked(pubkeyHexLowercased: pub) {
+        if let pub = contextProvider?.nostrPubkeyForDisplayName(nickname) {
+            if !identityManager.isNostrBlocked(pubkeyHexLowercased: pub) {
                 return .success(message: "\(nickname) is not blocked")
             }
-            SecureIdentityStateManager.shared.setNostrBlocked(pub, isBlocked: false)
+            identityManager.setNostrBlocked(pub, isBlocked: false)
             return .success(message: "unblocked \(nickname) in geohash chats")
         }
         return .error(message: "cannot unblock \(nickname): not found")
@@ -282,8 +318,8 @@ class CommandProcessor {
         
         let nickname = targetName.hasPrefix("@") ? String(targetName.dropFirst()) : targetName
         
-        guard let peerID = chatViewModel?.getPeerIDForNickname(nickname),
-              let noisePublicKey = Data(hexString: peerID) else {
+        guard let peerID = contextProvider?.getPeerIDForNickname(nickname),
+              let noisePublicKey = Data(hexString: peerID.id) else {
             return .error(message: "can't find peer: \(nickname)")
         }
         
@@ -295,33 +331,18 @@ class CommandProcessor {
                 peerNickname: nickname
             )
             
-            chatViewModel?.toggleFavorite(peerID: peerID)
-            chatViewModel?.sendFavoriteNotification(to: peerID, isFavorite: true)
+            contextProvider?.toggleFavorite(peerID: peerID)
+            contextProvider?.sendFavoriteNotification(to: peerID, isFavorite: true)
             
             return .success(message: "added \(nickname) to favorites")
         } else {
             FavoritesPersistenceService.shared.removeFavorite(peerNoisePublicKey: noisePublicKey)
             
-            chatViewModel?.toggleFavorite(peerID: peerID)
-            chatViewModel?.sendFavoriteNotification(to: peerID, isFavorite: false)
+            contextProvider?.toggleFavorite(peerID: peerID)
+            contextProvider?.sendFavoriteNotification(to: peerID, isFavorite: false)
             
             return .success(message: "removed \(nickname) from favorites")
         }
     }
     
-    private func handleHelp() -> CommandResult {
-        let helpText = """
-        commands:
-        /msg @name - start private chat
-        /who - list who's online
-        /clear - clear messages
-        /hug @name - send a hug
-        /slap @name - slap with a trout
-        /fav @name - add to favorites
-        /unfav @name - remove from favorites
-        /block @name - block
-        /unblock @name - unblock
-        """
-        return .success(message: helpText)
-    }
 }

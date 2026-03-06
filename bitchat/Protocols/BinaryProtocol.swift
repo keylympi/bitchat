@@ -22,11 +22,11 @@
 ///
 /// ## Wire Format
 /// ```
-/// Header (Fixed 13 bytes):
-/// +--------+------+-----+-----------+-------+----------------+
-/// |Version | Type | TTL | Timestamp | Flags | PayloadLength  |
-/// |1 byte  |1 byte|1byte| 8 bytes   | 1 byte| 2 bytes        |
-/// +--------+------+-----+-----------+-------+----------------+
+/// Header (Fixed 14 bytes for v1, 16 bytes for v2):
+/// +--------+------+-----+-----------+-------+------------------+
+/// |Version | Type | TTL | Timestamp | Flags | PayloadLength    |
+/// |1 byte  |1 byte|1byte| 8 bytes   | 1 byte| 2 or 4 bytes     |
+/// +--------+------+-----+-----------+-------+------------------+
 ///
 /// Variable sections:
 /// +----------+-------------+---------+------------+
@@ -52,7 +52,7 @@
 /// ## Flag Bits
 /// - Bit 0: Has recipient ID (directed message)
 /// - Bit 1: Has signature (authenticated message)
-/// - Bit 2: Is compressed (LZ4 compression applied)
+/// - Bit 2: Is compressed (zlib compression applied)
 /// - Bits 3-7: Reserved for future use
 ///
 /// ## Size Constraints
@@ -89,6 +89,7 @@
 ///
 
 import Foundation
+import BitLogger
 
 extension Data {
     func trimmingNullBytes() -> Data {
@@ -105,78 +106,125 @@ extension Data {
 /// their binary wire format representation.
 /// - Note: All multi-byte values use network byte order (big-endian)
 struct BinaryProtocol {
-    static let headerSize = 13
+    static let v1HeaderSize = 14
+    static let v2HeaderSize = 16
     static let senderIDSize = 8
     static let recipientIDSize = 8
     static let signatureSize = 64
+
+    // Field offsets within packet header
+    struct Offsets {
+        static let version = 0
+        static let type = 1
+        static let ttl = 2
+        static let timestamp = 3
+        static let flags = 11  // After version(1) + type(1) + ttl(1) + timestamp(8)
+    }
+
+    static func headerSize(for version: UInt8) -> Int? {
+        switch version {
+        case 1: return v1HeaderSize
+        case 2: return v2HeaderSize
+        default: return nil
+        }
+    }
+
+    private static func lengthFieldSize(for version: UInt8) -> Int {
+        return version == 2 ? 4 : 2
+    }
     
     struct Flags {
         static let hasRecipient: UInt8 = 0x01
         static let hasSignature: UInt8 = 0x02
         static let isCompressed: UInt8 = 0x04
+        static let hasRoute: UInt8 = 0x08
+        static let isRSR: UInt8 = 0x10
     }
     
     // Encode BitchatPacket to binary format
     static func encode(_ packet: BitchatPacket, padding: Bool = true) -> Data? {
-        var data = Data()
-        
-        
-        // Try to compress payload if beneficial
+        let version = packet.version
+        guard version == 1 || version == 2 else { return nil }
+
+        // Try to compress payload when beneficial, keeping original size for later decoding
         var payload = packet.payload
-        var originalPayloadSize: UInt16? = nil
         var isCompressed = false
-        
+        var originalPayloadSize: Int?
         if CompressionUtil.shouldCompress(payload) {
-            if let compressedPayload = CompressionUtil.compress(payload) {
-                // Store original size for decompression (2 bytes after payload)
-                originalPayloadSize = UInt16(payload.count)
+            // Only compress when we can represent the original length in the outbound frame
+            let maxRepresentable = version == 2 ? Int(UInt32.max) : Int(UInt16.max)
+            if payload.count <= maxRepresentable,
+               let compressedPayload = CompressionUtil.compress(payload) {
+                originalPayloadSize = payload.count
                 payload = compressedPayload
                 isCompressed = true
-                
-            } else {
             }
-        } else {
         }
+
+        let lengthFieldBytes = lengthFieldSize(for: version)
         
-        // Header
-        data.append(packet.version)
+        // Route is only supported for v2+ packets (per SOURCE_ROUTING.md spec)
+        let originalRoute = (version >= 2) ? (packet.route ?? []) : []
+        if originalRoute.contains(where: { $0.isEmpty }) { return nil }
+        let sanitizedRoute: [Data] = originalRoute.map { hop in
+            if hop.count == senderIDSize { return hop }
+            if hop.count > senderIDSize { return Data(hop.prefix(senderIDSize)) }
+            var padded = hop
+            padded.append(Data(repeating: 0, count: senderIDSize - hop.count))
+            return padded
+        }
+        guard sanitizedRoute.count <= 255 else { return nil }
+
+        let hasRoute = !sanitizedRoute.isEmpty
+        let routeLength = hasRoute ? 1 + sanitizedRoute.count * senderIDSize : 0
+        let originalSizeFieldBytes = isCompressed ? lengthFieldBytes : 0
+        // payloadLength in header is payload-only (does NOT include route bytes)
+        let payloadDataSize = payload.count + originalSizeFieldBytes
+
+        if version == 1 && payloadDataSize > Int(UInt16.max) { return nil }
+        if version == 2 && payloadDataSize > Int(UInt32.max) { return nil }
+
+        guard let headerSize = headerSize(for: version) else { return nil }
+        let estimatedHeader = headerSize + senderIDSize + (packet.recipientID == nil ? 0 : recipientIDSize) + routeLength
+        let estimatedPayload = payloadDataSize
+        let estimatedSignature = (packet.signature == nil ? 0 : signatureSize)
+        var data = Data()
+        data.reserveCapacity(estimatedHeader + estimatedPayload + estimatedSignature + 255)
+
+        data.append(version)
         data.append(packet.type)
         data.append(packet.ttl)
-        
-        // Timestamp (8 bytes, big-endian)
-        for i in (0..<8).reversed() {
-            data.append(UInt8((packet.timestamp >> (i * 8)) & 0xFF))
+
+        for shift in stride(from: 56, through: 0, by: -8) {
+            data.append(UInt8((packet.timestamp >> UInt64(shift)) & 0xFF))
         }
-        
-        // Flags
+
         var flags: UInt8 = 0
-        if packet.recipientID != nil {
-            flags |= Flags.hasRecipient
-        }
-        if packet.signature != nil {
-            flags |= Flags.hasSignature
-        }
-        if isCompressed {
-            flags |= Flags.isCompressed
-        }
+        if packet.recipientID != nil { flags |= Flags.hasRecipient }
+        if packet.signature != nil { flags |= Flags.hasSignature }
+        if isCompressed { flags |= Flags.isCompressed }
+        // HAS_ROUTE is only valid for v2+ packets
+        if hasRoute && version >= 2 { flags |= Flags.hasRoute }
+        if packet.isRSR { flags |= Flags.isRSR }
         data.append(flags)
         
-        // Payload length (2 bytes, big-endian) - includes original size if compressed
-        let payloadDataSize = payload.count + (isCompressed ? 2 : 0)
-        let payloadLength = UInt16(payloadDataSize)
-        
-        
-        data.append(UInt8((payloadLength >> 8) & 0xFF))
-        data.append(UInt8(payloadLength & 0xFF))
-        
-        // SenderID (exactly 8 bytes)
+        if version == 2 {
+            let length = UInt32(payloadDataSize)
+            for shift in stride(from: 24, through: 0, by: -8) {
+                data.append(UInt8((length >> UInt32(shift)) & 0xFF))
+            }
+        } else {
+            let length = UInt16(payloadDataSize)
+            data.append(UInt8((length >> 8) & 0xFF))
+            data.append(UInt8(length & 0xFF))
+        }
+
         let senderBytes = packet.senderID.prefix(senderIDSize)
         data.append(senderBytes)
         if senderBytes.count < senderIDSize {
             data.append(Data(repeating: 0, count: senderIDSize - senderBytes.count))
         }
-        
-        // RecipientID (if present)
+
         if let recipientID = packet.recipientID {
             let recipientBytes = recipientID.prefix(recipientIDSize)
             data.append(recipientBytes)
@@ -184,30 +232,37 @@ struct BinaryProtocol {
                 data.append(Data(repeating: 0, count: recipientIDSize - recipientBytes.count))
             }
         }
-        
-        // Payload (with original size prepended if compressed)
+
+        if hasRoute {
+            data.append(UInt8(sanitizedRoute.count))
+            for hop in sanitizedRoute {
+                data.append(hop)
+            }
+        }
+
         if isCompressed, let originalSize = originalPayloadSize {
-            // Prepend original size (2 bytes, big-endian)
-            data.append(UInt8((originalSize >> 8) & 0xFF))
-            data.append(UInt8(originalSize & 0xFF))
+            if version == 2 {
+                let value = UInt32(originalSize)
+                for shift in stride(from: 24, through: 0, by: -8) {
+                    data.append(UInt8((value >> UInt32(shift)) & 0xFF))
+                }
+            } else {
+                let value = UInt16(originalSize)
+                data.append(UInt8((value >> 8) & 0xFF))
+                data.append(UInt8(value & 0xFF))
+            }
         }
         data.append(payload)
-        
-        // Signature (if present)
+
         if let signature = packet.signature {
             data.append(signature.prefix(signatureSize))
         }
-        
-        
-        // Apply padding to standard block sizes for traffic analysis resistance
+
         if padding {
             let optimalSize = MessagePadding.optimalBlockSize(for: data.count)
-            let paddedData = MessagePadding.pad(data, toSize: optimalSize)
-            return paddedData
-        } else {
-            // Caller explicitly requested no padding (e.g., BLE write path)
-            return data
+            return MessagePadding.pad(data, toSize: optimalSize)
         }
+        return data
     }
     
     // Decode binary data to BitchatPacket
@@ -222,367 +277,146 @@ struct BinaryProtocol {
 
     // Core decoding implementation used by decode(_:) with and without padding removal
     private static func decodeCore(_ raw: Data) -> BitchatPacket? {
-        // Minimum size check: header + senderID
-        guard raw.count >= headerSize + senderIDSize else { 
-            return nil 
-        }
-        
-        // Convert to array for safer indexed access
-        let dataArray = Array(raw)
-        var offset = 0
-        
-        // Header parsing with bounds checks
-        guard offset < dataArray.count else { return nil }
-        let version = dataArray[offset]; offset += 1
-        
-        // Check if version is 1 (only supported version)
-        guard version == 1 else { 
-            return nil 
-        }
-        
-        guard offset < dataArray.count else { return nil }
-        let type = dataArray[offset]; offset += 1
-        
-        guard offset < dataArray.count else { return nil }
-        let ttl = dataArray[offset]; offset += 1
-        
-        // Timestamp - need 8 bytes
-        guard offset + 8 <= dataArray.count else { return nil }
-        let timestampData = Data(dataArray[offset..<offset+8])
-        let timestamp = timestampData.reduce(0) { result, byte in
-            (result << 8) | UInt64(byte)
-        }
-        offset += 8
-        
-        // Flags
-        guard offset < dataArray.count else { return nil }
-        let flags = dataArray[offset]; offset += 1
-        let hasRecipient = (flags & Flags.hasRecipient) != 0
-        let hasSignature = (flags & Flags.hasSignature) != 0
-        let isCompressed = (flags & Flags.isCompressed) != 0
-        
-        // Payload length - need 2 bytes
-        guard offset + 2 <= dataArray.count else { return nil }
-        let payloadLengthData = Data(dataArray[offset..<offset+2])
-        let payloadLength = payloadLengthData.reduce(0) { result, byte in
-            (result << 8) | UInt16(byte)
-        }
-        offset += 2
-        
-        // Validate payloadLength is reasonable (prevent integer overflow)
-        guard payloadLength <= 65535 else { return nil }
-        
-        // SenderID - need 8 bytes
-        guard offset + senderIDSize <= dataArray.count else { return nil }
-        let senderID = Data(dataArray[offset..<offset+senderIDSize])
-        offset += senderIDSize
-        
-        // RecipientID if present
-        var recipientID: Data?
-        if hasRecipient {
-            guard offset + recipientIDSize <= dataArray.count else { return nil }
-            recipientID = Data(dataArray[offset..<offset+recipientIDSize])
-            offset += recipientIDSize
-        }
-        
-        // Payload handling with comprehensive bounds checking
-        let payload: Data
-        if isCompressed {
-            // Compressed payload needs at least 2 bytes for original size
-            guard Int(payloadLength) >= 2 else { return nil }
-            
-            // Check we have enough data for the original size prefix
-            guard offset + 2 <= dataArray.count else { return nil }
-            let originalSizeData = Data(dataArray[offset..<offset+2])
-            let originalSize = Int(originalSizeData.reduce(0) { result, byte in
-                (result << 8) | UInt16(byte)
-            })
-            offset += 2
-            
-            // Validate original size is reasonable
-            guard originalSize >= 0 && originalSize <= 1048576 else { return nil } // Max 1MB
-            
-            // Check we have enough data for the compressed payload
-            let compressedPayloadSize = Int(payloadLength) - 2
-            guard compressedPayloadSize >= 0 && offset + compressedPayloadSize <= dataArray.count else { 
-                return nil 
-            }
-            
-            let compressedPayload = Data(dataArray[offset..<offset+compressedPayloadSize])
-            offset += compressedPayloadSize
-            
-            // Decompress with error handling
-            guard let decompressedPayload = CompressionUtil.decompress(compressedPayload, originalSize: originalSize) else {
-                return nil
-            }
-            
-            // Verify decompressed size matches expected
-            guard decompressedPayload.count == originalSize else {
-                return nil
-            }
-            
-            payload = decompressedPayload
-        } else {
-            // Uncompressed payload
-            guard Int(payloadLength) >= 0 && offset + Int(payloadLength) <= dataArray.count else { 
-                return nil 
-            }
-            payload = Data(dataArray[offset..<offset+Int(payloadLength)])
-            offset += Int(payloadLength)
-        }
-        
-        // Signature if present
-        var signature: Data?
-        if hasSignature {
-            guard offset + signatureSize <= dataArray.count else { return nil }
-            signature = Data(dataArray[offset..<offset+signatureSize])
-            offset += signatureSize
-        }
-        
-        // Final validation: ensure we haven't gone past the end
-        guard offset <= dataArray.count else { return nil }
-        
-        return BitchatPacket(
-            type: type,
-            senderID: senderID,
-            recipientID: recipientID,
-            timestamp: timestamp,
-            payload: payload,
-            signature: signature,
-            ttl: ttl
-        )
-    }
-}
+        guard raw.count >= v1HeaderSize + senderIDSize else { return nil }
 
-// Binary encoding for BitchatMessage
-extension BitchatMessage {
-    func toBinaryPayload() -> Data? {
-        var data = Data()
-        
-        // Message format:
-        // - Flags: 1 byte (bit 0: isRelay, bit 1: isPrivate, bit 2: hasOriginalSender, bit 3: hasRecipientNickname, bit 4: hasSenderPeerID, bit 5: hasMentions)
-        // - Timestamp: 8 bytes (seconds since epoch)
-        // - ID length: 1 byte
-        // - ID: variable
-        // - Sender length: 1 byte
-        // - Sender: variable
-        // - Content length: 2 bytes
-        // - Content: variable
-        // Optional fields based on flags:
-        // - Original sender length + data
-        // - Recipient nickname length + data
-        // - Sender peer ID length + data
-        // - Mentions array
-        
-        var flags: UInt8 = 0
-        if isRelay { flags |= 0x01 }
-        if isPrivate { flags |= 0x02 }
-        if originalSender != nil { flags |= 0x04 }
-        if recipientNickname != nil { flags |= 0x08 }
-        if senderPeerID != nil { flags |= 0x10 }
-        if mentions != nil && !mentions!.isEmpty { flags |= 0x20 }
-        
-        data.append(flags)
-        
-        // Timestamp (in milliseconds)
-        let timestampMillis = UInt64(timestamp.timeIntervalSince1970 * 1000)
-        // Encode as 8 bytes, big-endian
-        for i in (0..<8).reversed() {
-            data.append(UInt8((timestampMillis >> (i * 8)) & 0xFF))
-        }
-        
-        // ID
-        if let idData = id.data(using: .utf8) {
-            data.append(UInt8(min(idData.count, 255)))
-            data.append(idData.prefix(255))
-        } else {
-            data.append(0)
-        }
-        
-        // Sender
-        if let senderData = sender.data(using: .utf8) {
-            data.append(UInt8(min(senderData.count, 255)))
-            data.append(senderData.prefix(255))
-        } else {
-            data.append(0)
-        }
-        
-        // Content
-        if let contentData = content.data(using: .utf8) {
-            let length = UInt16(min(contentData.count, 65535))
-            // Encode length as 2 bytes, big-endian
-            data.append(UInt8((length >> 8) & 0xFF))
-            data.append(UInt8(length & 0xFF))
-            data.append(contentData.prefix(Int(length)))
-        } else {
-            data.append(contentsOf: [0, 0])
-        }
-        
-        // Optional fields
-        if let originalSender = originalSender, let origData = originalSender.data(using: .utf8) {
-            data.append(UInt8(min(origData.count, 255)))
-            data.append(origData.prefix(255))
-        }
-        
-        if let recipientNickname = recipientNickname, let recipData = recipientNickname.data(using: .utf8) {
-            data.append(UInt8(min(recipData.count, 255)))
-            data.append(recipData.prefix(255))
-        }
-        
-        if let senderPeerID = senderPeerID, let peerData = senderPeerID.data(using: .utf8) {
-            data.append(UInt8(min(peerData.count, 255)))
-            data.append(peerData.prefix(255))
-        }
-        
-        // Mentions array
-        if let mentions = mentions {
-            data.append(UInt8(min(mentions.count, 255))) // Number of mentions
-            for mention in mentions.prefix(255) {
-                if let mentionData = mention.data(using: .utf8) {
-                    data.append(UInt8(min(mentionData.count, 255)))
-                    data.append(mentionData.prefix(255))
-                } else {
-                    data.append(0)
-                }
+        return raw.withUnsafeBytes { (buf: UnsafeRawBufferPointer) -> BitchatPacket? in
+            guard let base = buf.baseAddress else { return nil }
+            var offset = 0
+            func require(_ n: Int) -> Bool { offset + n <= buf.count }
+            func read8() -> UInt8? {
+                guard require(1) else { return nil }
+                let value = base.advanced(by: offset).assumingMemoryBound(to: UInt8.self).pointee
+                offset += 1
+                return value
             }
-        }
-        
-        
-        return data
-    }
-    
-    static func fromBinaryPayload(_ data: Data) -> BitchatMessage? {
-        // Create an immutable copy to prevent threading issues
-        let dataCopy = Data(data)
-        
-        
-        guard dataCopy.count >= 13 else { 
-            return nil 
-        }
-        
-        var offset = 0
-        
-        // Flags
-        guard offset < dataCopy.count else { 
-            return nil 
-        }
-        let flags = dataCopy[offset]; offset += 1
-        let isRelay = (flags & 0x01) != 0
-        let isPrivate = (flags & 0x02) != 0
-        let hasOriginalSender = (flags & 0x04) != 0
-        let hasRecipientNickname = (flags & 0x08) != 0
-        let hasSenderPeerID = (flags & 0x10) != 0
-        let hasMentions = (flags & 0x20) != 0
-        
-        // Timestamp
-        guard offset + 8 <= dataCopy.count else { 
-            return nil 
-        }
-        let timestampData = dataCopy[offset..<offset+8]
-        let timestampMillis = timestampData.reduce(0) { result, byte in
-            (result << 8) | UInt64(byte)
-        }
-        offset += 8
-        let timestamp = Date(timeIntervalSince1970: TimeInterval(timestampMillis) / 1000.0)
-        
-        // ID
-        guard offset < dataCopy.count else { 
-            return nil 
-        }
-        let idLength = Int(dataCopy[offset]); offset += 1
-        guard offset + idLength <= dataCopy.count else { 
-            return nil 
-        }
-        let id = String(data: dataCopy[offset..<offset+idLength], encoding: .utf8) ?? UUID().uuidString
-        offset += idLength
-        
-        // Sender
-        guard offset < dataCopy.count else { 
-            return nil 
-        }
-        let senderLength = Int(dataCopy[offset]); offset += 1
-        guard offset + senderLength <= dataCopy.count else { 
-            return nil 
-        }
-        let sender = String(data: dataCopy[offset..<offset+senderLength], encoding: .utf8) ?? "unknown"
-        offset += senderLength
-        
-        // Content
-        guard offset + 2 <= dataCopy.count else { 
-            return nil 
-        }
-        let contentLengthData = dataCopy[offset..<offset+2]
-        let contentLength = Int(contentLengthData.reduce(0) { result, byte in
-            (result << 8) | UInt16(byte)
-        })
-        offset += 2
-        guard offset + contentLength <= dataCopy.count else { 
-            return nil 
-        }
-        
-        let content = String(data: dataCopy[offset..<offset+contentLength], encoding: .utf8) ?? ""
-        offset += contentLength
-        
-        // Optional fields
-        var originalSender: String?
-        if hasOriginalSender && offset < dataCopy.count {
-            let length = Int(dataCopy[offset]); offset += 1
-            if offset + length <= dataCopy.count {
-                originalSender = String(data: dataCopy[offset..<offset+length], encoding: .utf8)
-                offset += length
+            func read16() -> UInt16? {
+                guard require(2) else { return nil }
+                let ptr = base.advanced(by: offset).assumingMemoryBound(to: UInt8.self)
+                let value = (UInt16(ptr[0]) << 8) | UInt16(ptr[1])
+                offset += 2
+                return value
             }
-        }
-        
-        var recipientNickname: String?
-        if hasRecipientNickname && offset < dataCopy.count {
-            let length = Int(dataCopy[offset]); offset += 1
-            if offset + length <= dataCopy.count {
-                recipientNickname = String(data: dataCopy[offset..<offset+length], encoding: .utf8)
-                offset += length
+            func read32() -> UInt32? {
+                guard require(4) else { return nil }
+                let ptr = base.advanced(by: offset).assumingMemoryBound(to: UInt8.self)
+                let value = (UInt32(ptr[0]) << 24) | (UInt32(ptr[1]) << 16) | (UInt32(ptr[2]) << 8) | UInt32(ptr[3])
+                offset += 4
+                return value
             }
-        }
-        
-        var senderPeerID: String?
-        if hasSenderPeerID && offset < dataCopy.count {
-            let length = Int(dataCopy[offset]); offset += 1
-            if offset + length <= dataCopy.count {
-                senderPeerID = String(data: dataCopy[offset..<offset+length], encoding: .utf8)
-                offset += length
+            func readData(_ n: Int) -> Data? {
+                guard require(n) else { return nil }
+                let ptr = base.advanced(by: offset)
+                let data = Data(bytes: ptr, count: n)
+                offset += n
+                return data
             }
-        }
-        
-        // Mentions array
-        var mentions: [String]?
-        if hasMentions && offset < dataCopy.count {
-            let mentionCount = Int(dataCopy[offset]); offset += 1
-            if mentionCount > 0 {
-                mentions = []
-                for _ in 0..<mentionCount {
-                    if offset < dataCopy.count {
-                        let length = Int(dataCopy[offset]); offset += 1
-                        if offset + length <= dataCopy.count {
-                            if let mention = String(data: dataCopy[offset..<offset+length], encoding: .utf8) {
-                                mentions?.append(mention)
-                            }
-                            offset += length
-                        }
+
+            guard let version = read8(), version == 1 || version == 2 else { return nil }
+            let lengthFieldBytes = lengthFieldSize(for: version)
+            guard let headerSize = headerSize(for: version) else { return nil }
+            let minimumRequired = headerSize + senderIDSize
+            guard raw.count >= minimumRequired else { return nil }
+
+            guard let type = read8(), let ttl = read8() else { return nil }
+
+            var timestamp: UInt64 = 0
+            for _ in 0..<8 {
+                guard let byte = read8() else { return nil }
+                timestamp = (timestamp << 8) | UInt64(byte)
+            }
+
+            guard let flags = read8() else { return nil }
+            let hasRecipient = (flags & Flags.hasRecipient) != 0
+            let hasSignature = (flags & Flags.hasSignature) != 0
+            let isCompressed = (flags & Flags.isCompressed) != 0
+            // HAS_ROUTE is only valid for v2+ packets; ignore the flag for v1
+            let hasRoute = (version >= 2) && (flags & Flags.hasRoute) != 0
+            let isRSR = (flags & Flags.isRSR) != 0
+            
+            let payloadLength: Int
+            if version == 2 {
+                guard let len = read32() else { return nil }
+                payloadLength = Int(len)
+            } else {
+                guard let len = read16() else { return nil }
+                payloadLength = Int(len)
+            }
+
+            guard payloadLength >= 0 else { return nil }
+            guard payloadLength <= FileTransferLimits.maxFramedFileBytes else { return nil }
+
+            guard let senderID = readData(senderIDSize) else { return nil }
+
+            var recipientID: Data? = nil
+            if hasRecipient {
+                recipientID = readData(recipientIDSize)
+                if recipientID == nil { return nil }
+            }
+
+            // Route (optional, v2+ only): route bytes are NOT included in payloadLength
+            var route: [Data]? = nil
+            if hasRoute {
+                guard let routeCount = read8() else { return nil }
+                if routeCount > 0 {
+                    var hops: [Data] = []
+                    for _ in 0..<Int(routeCount) {
+                        guard let hop = readData(senderIDSize) else { return nil }
+                        hops.append(hop)
                     }
+                    route = hops
                 }
             }
+
+            // Payload: payloadLength is exactly the payload size (+ compression preamble if compressed)
+            let payload: Data
+            if isCompressed {
+                guard payloadLength >= lengthFieldBytes else { return nil }
+                let originalSize: Int
+                if version == 2 {
+                    guard let rawSize = read32() else { return nil }
+                    originalSize = Int(rawSize)
+                } else {
+                    guard let rawSize = read16() else { return nil }
+                    originalSize = Int(rawSize)
+                }
+                guard originalSize >= 0 && originalSize <= FileTransferLimits.maxFramedFileBytes else { return nil }
+                let compressedSize = payloadLength - lengthFieldBytes
+                guard compressedSize > 0, let compressed = readData(compressedSize) else { return nil }
+
+                let compressionRatio = Double(originalSize) / Double(compressedSize)
+                guard compressionRatio <= 50_000.0 else {
+                    SecureLogger.warning("🚫 Suspicious compression ratio: \(String(format: "%.0f", compressionRatio)):1", category: .security)
+                    return nil
+                }
+
+                guard let decompressed = CompressionUtil.decompress(compressed, originalSize: originalSize),
+                      decompressed.count == originalSize else { return nil }
+                payload = decompressed
+            } else {
+                guard let rawPayload = readData(payloadLength) else { return nil }
+                payload = rawPayload
+            }
+
+            var signature: Data? = nil
+            if hasSignature {
+                signature = readData(signatureSize)
+                if signature == nil { return nil }
+            }
+
+            guard offset <= buf.count else { return nil }
+
+            return BitchatPacket(
+                type: type,
+                senderID: senderID,
+                recipientID: recipientID,
+                timestamp: timestamp,
+                payload: payload,
+                signature: signature,
+                ttl: ttl,
+                version: version,
+                route: route,
+                isRSR: isRSR
+            )
         }
-        
-        let message = BitchatMessage(
-            id: id,
-            sender: sender,
-            content: content,
-            timestamp: timestamp,
-            isRelay: isRelay,
-            originalSender: originalSender,
-            isPrivate: isPrivate,
-            recipientNickname: recipientNickname,
-            senderPeerID: senderPeerID,
-            mentions: mentions
-        )
-        return message
     }
 }

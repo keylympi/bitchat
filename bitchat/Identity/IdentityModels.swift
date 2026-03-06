@@ -87,7 +87,7 @@ import Foundation
 /// Represents the ephemeral layer of identity - short-lived peer IDs that provide network privacy.
 /// These IDs rotate periodically to prevent tracking while maintaining cryptographic relationships.
 struct EphemeralIdentity {
-    let peerID: String          // 8 random bytes
+    let peerID: PeerID          // 8 random bytes
     let sessionStart: Date
     var handshakeState: HandshakeState
 }
@@ -106,6 +106,8 @@ enum HandshakeState {
 struct CryptographicIdentity: Codable {
     let fingerprint: String     // SHA256 of public key
     let publicKey: Data         // Noise static public key
+    // Optional Ed25519 signing public key (used to authenticate public messages)
+    var signingPublicKey: Data? = nil
     let firstSeen: Date
     let lastHandshake: Date?
 }
@@ -154,23 +156,6 @@ struct IdentityCache: Codable {
     
     // Schema version for future migrations
     var version: Int = 1
-}
-
-// MARK: - Identity Resolution
-
-enum IdentityHint {
-    case unknown
-    case likelyKnown(fingerprint: String)
-    case ambiguous(candidates: Set<String>)
-    case verified(fingerprint: String)
-}
-
-// MARK: - Pending Actions
-
-struct PendingActions {
-    var toggleFavorite: Bool?
-    var setTrustLevel: TrustLevel?
-    var setPetname: String?
 }
 
 //

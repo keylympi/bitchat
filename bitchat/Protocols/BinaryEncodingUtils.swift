@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import CryptoKit
 
 // MARK: - Hex Encoding/Decoding
 
@@ -16,21 +17,48 @@ extension Data {
         }
         return self.map { String(format: "%02x", $0) }.joined()
     }
+
+    func sha256Hex() -> String {
+        let digest = SHA256.hash(data: self)
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
     
+    /// Initialize Data from a hex string.
+    /// - Parameter hexString: A hex string, optionally prefixed with "0x" or "0X".
+    ///   Whitespace is trimmed. Must have even length after prefix removal.
+    /// - Returns: nil if the string has odd length or contains invalid hex characters.
     init?(hexString: String) {
-        let len = hexString.count / 2
+        var hex = hexString.trimmingCharacters(in: .whitespaces)
+
+        // Remove optional 0x prefix
+        if hex.hasPrefix("0x") || hex.hasPrefix("0X") {
+            hex = String(hex.dropFirst(2))
+        }
+
+        // Reject odd-length strings
+        guard hex.count % 2 == 0 else {
+            return nil
+        }
+
+        // Reject empty strings
+        guard !hex.isEmpty else {
+            self = Data()
+            return
+        }
+
+        let len = hex.count / 2
         var data = Data(capacity: len)
-        var index = hexString.startIndex
-        
+        var index = hex.startIndex
+
         for _ in 0..<len {
-            let nextIndex = hexString.index(index, offsetBy: 2)
-            guard let byte = UInt8(String(hexString[index..<nextIndex]), radix: 16) else {
+            let nextIndex = hex.index(index, offsetBy: 2)
+            guard let byte = UInt8(String(hex[index..<nextIndex]), radix: 16) else {
                 return nil
             }
             data.append(byte)
             index = nextIndex
         }
-        
+
         self = data
     }
 }
@@ -40,23 +68,23 @@ extension Data {
 extension Data {
     // MARK: Writing
     
-    mutating func appendUInt8(_ value: UInt8) {
+    @inlinable mutating func appendUInt8(_ value: UInt8) {
         self.append(value)
     }
     
-    mutating func appendUInt16(_ value: UInt16) {
+    @inlinable mutating func appendUInt16(_ value: UInt16) {
         self.append(UInt8((value >> 8) & 0xFF))
         self.append(UInt8(value & 0xFF))
     }
     
-    mutating func appendUInt32(_ value: UInt32) {
+    @inlinable mutating func appendUInt32(_ value: UInt32) {
         self.append(UInt8((value >> 24) & 0xFF))
         self.append(UInt8((value >> 16) & 0xFF))
         self.append(UInt8((value >> 8) & 0xFF))
         self.append(UInt8(value & 0xFF))
     }
     
-    mutating func appendUInt64(_ value: UInt64) {
+    @inlinable mutating func appendUInt64(_ value: UInt64) {
         for i in (0..<8).reversed() {
             self.append(UInt8((value >> (i * 8)) & 0xFF))
         }
@@ -113,21 +141,21 @@ extension Data {
     
     // MARK: Reading
     
-    func readUInt8(at offset: inout Int) -> UInt8? {
+    @inlinable func readUInt8(at offset: inout Int) -> UInt8? {
         guard offset >= 0 && offset < self.count else { return nil }
         let value = self[offset]
         offset += 1
         return value
     }
     
-    func readUInt16(at offset: inout Int) -> UInt16? {
+    @inlinable func readUInt16(at offset: inout Int) -> UInt16? {
         guard offset + 2 <= self.count else { return nil }
         let value = UInt16(self[offset]) << 8 | UInt16(self[offset + 1])
         offset += 2
         return value
     }
     
-    func readUInt32(at offset: inout Int) -> UInt32? {
+    @inlinable func readUInt32(at offset: inout Int) -> UInt32? {
         guard offset + 4 <= self.count else { return nil }
         let value = UInt32(self[offset]) << 24 |
                    UInt32(self[offset + 1]) << 16 |
@@ -137,7 +165,7 @@ extension Data {
         return value
     }
     
-    func readUInt64(at offset: inout Int) -> UInt64? {
+    @inlinable func readUInt64(at offset: inout Int) -> UInt64? {
         guard offset + 8 <= self.count else { return nil }
         var value: UInt64 = 0
         for i in 0..<8 {
@@ -197,7 +225,7 @@ extension Data {
         offset += 16
         
         // Convert 16 bytes to UUID string format
-        let uuid = uuidData.map { String(format: "%02x", $0) }.joined()
+        let uuid = uuidData.hexEncodedString()
         
         // Insert hyphens at proper positions: 8-4-4-4-12
         var result = ""
@@ -220,4 +248,3 @@ extension Data {
         return data
     }
 }
-

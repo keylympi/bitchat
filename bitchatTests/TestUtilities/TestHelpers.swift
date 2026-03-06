@@ -10,7 +10,7 @@ import Foundation
 import CryptoKit
 @testable import bitchat
 
-class TestHelpers {
+final class TestHelpers {
     
     // MARK: - Key Generation
     
@@ -30,7 +30,7 @@ class TestHelpers {
     static func createTestMessage(
         content: String = TestConstants.testMessage1,
         sender: String = TestConstants.testNickname1,
-        senderPeerID: String = TestConstants.testPeerID1,
+        senderPeerID: PeerID = PeerID(str: UUID().uuidString),
         isPrivate: Bool = false,
         recipientNickname: String? = nil,
         mentions: [String]? = nil
@@ -51,16 +51,16 @@ class TestHelpers {
     
     static func createTestPacket(
         type: UInt8 = 0x01,
-        senderID: String = TestConstants.testPeerID1,
-        recipientID: String? = nil,
+        senderID: PeerID = PeerID(str: UUID().uuidString),
+        recipientID: PeerID? = nil,
         payload: Data = "test payload".data(using: .utf8)!,
         signature: Data? = nil,
         ttl: UInt8 = 3
     ) -> BitchatPacket {
         return BitchatPacket(
             type: type,
-            senderID: senderID.data(using: .utf8)!,
-            recipientID: recipientID?.data(using: .utf8),
+            senderID: senderID.id.data(using: .utf8)!,
+            recipientID: recipientID?.id.data(using: .utf8),
             timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
             payload: payload,
             signature: signature,
@@ -90,8 +90,24 @@ class TestHelpers {
             if Date().timeIntervalSince(start) > timeout {
                 throw TestError.timeout
             }
-            try await Task.sleep(nanoseconds: 10_000_000) // 10ms
+            try await sleep(0.01)
         }
+    }
+
+    @MainActor
+    static func waitUntil(
+        _ condition: @escaping () -> Bool,
+        timeout: TimeInterval = TestConstants.defaultTimeout,
+        pollInterval: TimeInterval = 0.01
+    ) async -> Bool {
+        let start = Date()
+        while !condition() {
+            if Date().timeIntervalSince(start) > timeout {
+                return condition()
+            }
+            try? await sleep(pollInterval)
+        }
+        return true
     }
     
     static func expectAsync<T>(
@@ -104,7 +120,7 @@ class TestHelpers {
             }
             
             group.addTask {
-                try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                try await sleep(1)
                 throw TestError.timeout
             }
             
@@ -119,4 +135,8 @@ enum TestError: Error {
     case timeout
     case unexpectedValue
     case testFailure(String)
+}
+
+func sleep(_ seconds: TimeInterval) async throws {
+    try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
 }
